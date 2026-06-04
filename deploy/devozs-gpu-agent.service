@@ -13,6 +13,14 @@ Type=simple
 User=__USER__
 Group=__GROUP__
 WorkingDirectory=__WORKDIR__
+# Put the venv's bin first on PATH. The service runs the venv python by absolute
+# path, but optimum-habana's version check shells out `pip list | grep
+# habana-torch-plugin` and resolves `pip` via PATH — without the venv on PATH it
+# finds the wrong/no pip, greps an empty result, and dies with IndexError before
+# any training starts. __VENV_BIN__ is the dir of __PYTHON__, filled in at
+# install. Listed BEFORE EnvironmentFile so a PATH in the env file can override.
+Environment=PATH=__VENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=VIRTUAL_ENV=__VENV__
 # All tunables (MGMT_URL, AGENT_TYPE, PT_HPU_LAZY_MODE, NO_PROXY, …) live here so
 # you can edit them without touching the unit. ENROLL_CODE is NOT needed after
 # the first enroll — the token is cached at ~/.devozs_gpu_agent/agent-token.json.

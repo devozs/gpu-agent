@@ -22,7 +22,8 @@
 # Env overrides:
 #   SYNAPSE_VERSION   SynapseAI version to install      (default 1.24.0)
 #   VENV              Habana venv path                  (default ~/habanalabs-venv)
-#   OPTIMUM_HABANA    optimum-habana version for §3     (default 1.20.0)
+#   OPTIMUM_HABANA    optimum-habana version for §3     (default 1.21.0)
+#   TRANSFORMERS      transformers pin (matches OH)      (default >=4.55,<4.56)
 #
 # This script is idempotent-ish: re-running skips clones/installs that already
 # exist. It is intentionally bare-metal (no Docker) — on Gaudi the SynapseAI
@@ -33,7 +34,14 @@ set -euo pipefail
 # --- config -----------------------------------------------------------------
 SYNAPSE_VERSION="${SYNAPSE_VERSION:-1.24.0}"
 VENV="${VENV:-$HOME/habanalabs-venv}"
-OPTIMUM_HABANA="${OPTIMUM_HABANA:-1.20.0}"
+# optimum-habana must match the SynapseAI/Gaudi release: v1.21.0 <-> Gaudi 1.24,
+# v1.20.0 <-> 1.23, v1.19.x <-> 1.22. optimum-habana monkey-patches transformers
+# per-model against ONE pinned transformers window — so transformers must also be
+# pinned to what that OH release declares, or a model's Gaudi forward override
+# gets kwargs it never declared (e.g. cache_position) and dies with a TypeError.
+OPTIMUM_HABANA="${OPTIMUM_HABANA:-1.21.0}"
+# transformers window OH 1.21.0 pins in its setup.py.
+TRANSFORMERS="${TRANSFORMERS:-transformers>=4.55.0,<4.56.0}"
 INSTALLER="habanalabs-installer.sh"
 
 WITH_HF=0
@@ -127,11 +135,16 @@ section_3_hf() {
   # PYTHONNOUSERSITE=1 keeps installs inside the venv; otherwise they leak into
   # ~/.local (a generic CUDA torch) and run_glue.py crashes in
   # check_synapse_version() with "IndexError: list index out of range".
-  # Version match: optimum-habana 1.N <-> SynapseAI 1.(N+4); 1.20.0 <-> 1.24.0.
+  # Version match: optimum-habana v1.21.0 <-> SynapseAI 1.24, v1.20.0 <-> 1.23,
+  # v1.19.x <-> 1.22 (per the OH release notes). A bare `git clone` lands the
+  # default branch (currently 1.19.x, built for the PREVIOUS Gaudi release), so
+  # we MUST checkout the matching tag — hence the explicit v${OPTIMUM_HABANA}.
   [ -d "$HOME/optimum-habana" ] || git clone https://github.com/huggingface/optimum-habana.git "$HOME/optimum-habana"
-  ( cd "$HOME/optimum-habana" && git checkout "v${OPTIMUM_HABANA}" )
+  ( cd "$HOME/optimum-habana" && git fetch --tags --quiet && git checkout "v${OPTIMUM_HABANA}" )
 
-  PYTHONNOUSERSITE=1 pip install "optimum-habana==${OPTIMUM_HABANA}"
+  # Pin transformers to OH's declared window in the SAME pip call so its resolver
+  # can't pull a newer transformers that breaks the per-model Gaudi forward patch.
+  PYTHONNOUSERSITE=1 pip install "optimum-habana==${OPTIMUM_HABANA}" "${TRANSFORMERS}"
   PYTHONNOUSERSITE=1 pip install -r "$HOME/optimum-habana/examples/text-classification/requirements.txt"
 
   log "3.2 Single-card training (run_glue.py, BERT-large on MRPC)"

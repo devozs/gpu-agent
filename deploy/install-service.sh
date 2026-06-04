@@ -71,6 +71,11 @@ fi
 
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
+# The unit puts the venv on PATH so optimum-habana's `pip list | grep` version
+# probe resolves the venv pip (it runs python by absolute path, not via PATH).
+VENV_BIN="$(dirname "$PYTHON")"
+VENV_ROOT="$(dirname "$VENV_BIN")"
+
 log "Service config"
 echo "  service : $SERVICE_NAME"
 echo "  user    : $RUN_USER ($RUN_GROUP)"
@@ -96,6 +101,8 @@ sed -e "s|__USER__|$RUN_USER|g" \
     -e "s|__WORKDIR__|$REPO_DIR|g" \
     -e "s|__ENVFILE__|$ENV_DEST|g" \
     -e "s|__PYTHON__|$PYTHON|g" \
+    -e "s|__VENV_BIN__|$VENV_BIN|g" \
+    -e "s|__VENV__|$VENV_ROOT|g" \
     "$UNIT_SRC" > "$tmp_unit"
 sudo cp "$tmp_unit" "$UNIT_DEST"
 rm -f "$tmp_unit"

@@ -17,6 +17,17 @@ class HpuBackend(TrainingBackend):
     name = "HPU"
 
     def load_tokenizer_and_model(self, base_model):
+        # Apply optimum-habana's Gaudi patches BEFORE from_pretrained. This swaps
+        # the model classes (e.g. GPTNeoForCausalLM -> GaudiGPTNeoForCausalLM,
+        # whose forward accepts cache_position) AND the inner *.forward methods.
+        # GaudiTrainer would call this too, but only at trainer-construction time
+        # — by then the model instance already exists, so the *class* swap misses
+        # it and you get a stock CausalLM calling a Gaudi model-forward that lacks
+        # cache_position -> TypeError. Patching here keeps the model fully Gaudi,
+        # and it's model-agnostic (every model OH supports gets its Gaudi classes).
+        from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+        adapt_transformers_to_gaudi()
+
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(

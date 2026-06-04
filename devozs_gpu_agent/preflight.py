@@ -67,15 +67,38 @@ def identify_nvidia() -> dict:
 
 def identify_gaudi() -> dict:
     # hl-smi output format varies by SynapseAI version; capture a short summary.
-    out = _run(["hl-smi", "-Q", "name,driver_version,memory.total", "-f", "csv,noheader"])
-    if out is None:
-        out = _run(["hl-smi"])  # fall back to the default table
+    # Prefer the CSV query (one row per card) so we can report a structured
+    # deviceCount/devices[] like CUDA does; fall back to the default table and
+    # count its device rows when the CSV query isn't supported.
     caps = {"tool": "hl-smi"}
+    csv = _run(["hl-smi", "-Q", "name,driver_version,memory.total", "-f", "csv,noheader"])
+    if csv:
+        devices = []
+        for line in (l.strip() for l in csv.splitlines() if l.strip()):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                devices.append({"name": parts[0], "driver": parts[1], "memory": parts[2]})
+        if devices:
+            caps["detected"] = True
+            caps["deviceCount"] = len(devices)
+            caps["devices"] = devices
+            return caps
+
+    out = csv or _run(["hl-smi"])  # fall back to the default table
     if not out:
         caps["detected"] = False
         return caps
     caps["detected"] = True
     caps["raw"] = out[:2000]
+    # Default table lists each card on a line like "| N  HL-325 ... |"; count
+    # those so the UI still gets a card count when the CSV query is unavailable.
+    try:
+        import re
+        rows = re.findall(r"^\|\s*\d+\s+HL-", out, flags=re.MULTILINE)
+        if rows:
+            caps["deviceCount"] = len(rows)
+    except Exception:
+        pass
     return caps
 
 
