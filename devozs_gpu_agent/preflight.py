@@ -116,7 +116,13 @@ def _sample_workload(device_kind: str) -> dict:
         sample = tokenizer.decode(out[0], skip_special_tokens=True)[:80]
         return {"probeModel": DEFAULT_PROBE_MODEL, "device": device, "sample": sample}
 
-    # Default: tiny in-memory model, no I/O.
+    # Default: tiny in-memory model, no I/O. We run a single forward pass rather
+    # than generate(): generate()'s special-token reconciliation builds ops that
+    # the Habana lazy-mode graph compiler rejects on a tiny random model
+    # (synStatus 26 "Graph compile failed"), and the tiny config's default
+    # eos_token_id (50256) is out of range for our vocab_size anyway. A forward
+    # pass is exactly what training runs — so it both compiles cleanly in lazy
+    # mode and is the honest "can this box train" signal.
     cfg = AutoConfig.for_model(
         "gpt2", vocab_size=128, n_positions=32, n_embd=32, n_layer=2, n_head=2,
     )
@@ -125,18 +131,18 @@ def _sample_workload(device_kind: str) -> dict:
     model.eval()
     input_ids = torch.randint(0, cfg.vocab_size, (1, 4)).to(device)
     with torch.no_grad():
-        out = model.generate(input_ids, max_new_tokens=8, do_sample=False)
+        out = model(input_ids)
     if device == "hpu":
-        # Flush the lazy graph so the generate actually executes on-device (the
+        # Flush the lazy graph so the forward actually executes on-device (the
         # mark_step the Habana quick-start does between steps). No-op in eager
         # mode (PT_HPU_LAZY_MODE=0); required under the default lazy mode.
         import habana_frameworks.torch.core as htcore
         htcore.mark_step()
     return {
-        "probeModel": "in-memory tiny-gpt2 (offline)",
+        "probeModel": "in-memory tiny-gpt2 (offline, forward pass)",
         "device": device,
         "lazyMode": os.getenv("PT_HPU_LAZY_MODE", "1"),
-        "generatedTokens": int(out.shape[-1]),
+        "logitsShape": list(out.logits.shape),
     }
 
 
