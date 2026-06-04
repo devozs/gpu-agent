@@ -46,7 +46,13 @@ class HpuBackend(TrainingBackend):
         from optimum.habana import GaudiConfig, GaudiTrainer, GaudiTrainingArguments
 
         hp = json.loads(job.hyperparams or "{}")
-        LOGGER.info("HPU backend training on Gaudi")
+        # Gaudi is a bf16-first accelerator: every optimum-habana training example
+        # (and our own run_glue.py smoke test) trains with --bf16. Plain fp32
+        # training trips the lazy-mode graph compiler on ops like layer-norm
+        # ("synStatus 26 ... layer_norm_fwd_f32 ... Graph compile failed"). Default
+        # bf16 ON for HPU; allow a job to force it off via hyperparams.bf16=false.
+        use_bf16 = bool(hp.get("bf16", True))
+        LOGGER.info("HPU backend training on Gaudi (bf16=%s)", use_bf16)
 
         gaudi_config = GaudiConfig(use_fused_adam=True, use_fused_clip_norm=True)
         args = GaudiTrainingArguments(
@@ -55,6 +61,7 @@ class HpuBackend(TrainingBackend):
             use_habana=True,
             use_lazy_mode=True,
             gaudi_config_name=None,
+            bf16=use_bf16,
             num_train_epochs=hp.get("epochs", 3),
             per_device_train_batch_size=hp.get("batchSize", 4),
             per_device_eval_batch_size=hp.get("batchSize", 4),
