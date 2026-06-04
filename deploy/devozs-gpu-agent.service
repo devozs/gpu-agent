@@ -1,0 +1,37 @@
+[Unit]
+Description=devozs GPU/HPU training agent
+Documentation=https://github.com/devozs/gpu-agent
+# Network is needed to reach management; the agent retries on its own, so this
+# is a best-effort ordering hint, not a hard gate.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- filled in by install-service.sh (placeholders replaced at install) ---
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__WORKDIR__
+# All tunables (MGMT_URL, AGENT_TYPE, PT_HPU_LAZY_MODE, NO_PROXY, …) live here so
+# you can edit them without touching the unit. ENROLL_CODE is NOT needed after
+# the first enroll — the token is cached at ~/.devozs_gpu_agent/agent-token.json.
+EnvironmentFile=__ENVFILE__
+# Run the module with the venv's python (has habana_frameworks + matched torch).
+ExecStart=__PYTHON__ -m devozs_gpu_agent
+
+# Resilience: keep the agent alive across crashes and transient faults. The poll
+# loop already backs off on network errors, so restarts are rare and cheap.
+Restart=always
+RestartSec=5
+# If it crashes hard >5 times in 60s, stop trying (a real config/env problem).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logs go to the journal: `journalctl -u devozs-gpu-agent -f`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devozs-gpu-agent
+
+[Install]
+WantedBy=multi-user.target

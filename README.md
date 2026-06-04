@@ -87,6 +87,35 @@ present after `setup-agent.sh`); `datasets`/`boto3`/`optimum-habana` are importe
 lazily and only when a job actually runs, so the box can reach **READY** before
 they're installed.
 
+### Run as a systemd service (recommended for a dedicated box)
+
+A box should stay enrolled and polling so it can claim jobs — if the agent
+process isn't running, the resource goes OFFLINE and can't be handed work. The
+bundled installer sets it up as a system service that starts on boot and
+auto-restarts on crash:
+
+```bash
+# After installing the agent into the venv AND enrolling once (so the token is
+# cached — see above), from the repo checkout:
+./deploy/install-service.sh
+```
+
+It auto-detects the venv python, repo dir, and current user; installs an env
+file at `/etc/devozs-gpu-agent.env`; then enables + starts
+`devozs-gpu-agent.service`. Edit `MGMT_URL` / `AGENT_TYPE` there:
+
+```bash
+sudoedit /etc/devozs-gpu-agent.env
+sudo systemctl restart devozs-gpu-agent
+journalctl -u devozs-gpu-agent -f          # live logs
+```
+
+The enrollment token is cached independently of the service, so the agent
+re-enrolls only on a brand-new box. To set up a never-enrolled box, put
+`ENROLL_CODE=...` in the env file for the first start, then remove it. Tear down
+with `./deploy/uninstall-service.sh` (add `--purge-env` to also drop the env
+file). See [deploy/](deploy/).
+
 ### Container (only if a published image matches your driver)
 
 `Dockerfile` builds a CUDA or Gaudi image; see its header for build/run commands.
@@ -143,6 +172,7 @@ devozs_gpu_agent/
     stub_backend.py      no-ML fake trainer for dev
 setup-agent.sh           Gaudi bare-metal setup + verify (gaudi-vm-setup.md §1–3)
 gaudi-vm-setup.md        manual reference for the setup/verify steps
+deploy/                  systemd service unit + install/uninstall scripts
 Dockerfile               optional CUDA/Gaudi container image
 ```
 
