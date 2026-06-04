@@ -1,0 +1,77 @@
+"""Intel Gaudi (HPU) backend via optimum-habana.
+
+Mirrors the CUDA backend but swaps in GaudiTrainer/GaudiTrainingArguments and the
+Habana runtime. These imports only work inside a Habana environment (SynapseAI +
+habana_frameworks must match the driver on the VM), so they are deferred to
+build_trainer — the agent process itself imports fine on a laptop.
+"""
+import json
+import logging
+
+from .base import TrainingBackend
+
+LOGGER = logging.getLogger(__name__)
+
+
+class HpuBackend(TrainingBackend):
+    name = "HPU"
+
+    def load_tokenizer_and_model(self, base_model):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model,
+            bos_token="<|startoftext|>",
+            eos_token="<|endoftext|>",
+            pad_token="<|pad|>",
+        )
+        model = AutoModelForCausalLM.from_pretrained(base_model, pad_token_id=tokenizer.pad_token_id)
+        model.resize_token_embeddings(len(tokenizer))
+        return tokenizer, model
+
+    def build_trainer(self, job, tokenizer, model, train_ds, eval_ds, output_dir, callbacks):
+        # Deferred imports: present only inside a Habana environment.
+        import habana_frameworks.torch.core as htcore  # noqa: F401
+        from optimum.habana import GaudiConfig, GaudiTrainer, GaudiTrainingArguments
+
+        hp = json.loads(job.hyperparams or "{}")
+        LOGGER.info("HPU backend training on Gaudi")
+
+        gaudi_config = GaudiConfig(use_fused_adam=True, use_fused_clip_norm=True)
+        args = GaudiTrainingArguments(
+            output_dir=output_dir,
+            overwrite_output_dir=not job.resume,
+            use_habana=True,
+            use_lazy_mode=True,
+            gaudi_config_name=None,
+            num_train_epochs=hp.get("epochs", 3),
+            per_device_train_batch_size=hp.get("batchSize", 4),
+            per_device_eval_batch_size=hp.get("batchSize", 4),
+            learning_rate=hp.get("learningRate", 5e-5),
+            warmup_steps=hp.get("warmupSteps", 10),
+            weight_decay=hp.get("weightDecay", 0.01),
+            save_steps=hp.get("saveSteps", 200),
+            save_total_limit=2,
+            logging_steps=10,
+            do_eval=eval_ds is not None,
+            report_to=[],
+        )
+        trainer = GaudiTrainer(
+            model=model,
+            gaudi_config=gaudi_config,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            callbacks=callbacks,
+        )
+        return trainer
+
+    def detect_capabilities(self) -> dict:
+        caps = {"backend": "HPU"}
+        try:
+            import habana_frameworks.torch.hpu as hthpu
+            caps["hpuAvailable"] = hthpu.is_available()
+            caps["deviceCount"] = hthpu.device_count()
+        except Exception:
+            caps["hpuAvailable"] = False
+        return caps
