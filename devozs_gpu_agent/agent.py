@@ -7,7 +7,9 @@ error so the session fails cleanly rather than hanging until the reaper.
 """
 import json
 import logging
+import os
 import time
+from urllib.parse import urlparse
 
 from .backends import make_backend
 from .config import AgentConfig
@@ -60,6 +62,33 @@ def _do_preflight(cfg: AgentConfig, client: ManagementClient) -> bool:
     return result.ok
 
 
+def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> None:
+    """Push a trained model dir up to management (fetch-to-local). OUTBOUND-only:
+    the agent reads its local file:// model dir and streams each file. Reports
+    completion either way so management clears the request and stops re-asking."""
+    try:
+        if not source_uri or not source_uri.startswith("file://"):
+            raise ValueError(f"model source is not a local path: {source_uri!r}")
+        root = urlparse(source_uri).path
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"model dir not found on this box: {root}")
+        count = 0
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                fpath = os.path.join(dirpath, name)
+                rel = os.path.relpath(fpath, root)
+                client.upload_model_file(session_id, rel, fpath)
+                count += 1
+        client.report_model_upload_complete(session_id, True)
+        LOGGER.info("pushed model for session %s (%d file(s)) to management", session_id, count)
+    except Exception as e:
+        LOGGER.exception("model push for session %s failed", session_id)
+        try:
+            client.report_model_upload_complete(session_id, False, str(e))
+        except Exception:
+            LOGGER.warning("could not report model upload failure", exc_info=True)
+
+
 def run(cfg: AgentConfig = None) -> None:
     cfg = cfg or AgentConfig()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -77,6 +106,9 @@ def run(cfg: AgentConfig = None) -> None:
             # Admin asked for a fresh check: re-run preflight and report.
             if isinstance(ack, dict) and ack.get("reverifyRequested"):
                 ready = _do_preflight(cfg, client)
+            # Admin asked to fetch a trained model to local: push it up.
+            if isinstance(ack, dict) and ack.get("modelUploadSessionId"):
+                _push_model(client, ack["modelUploadSessionId"], ack.get("modelUploadSourceUri"))
             if not ready:
                 time.sleep(cfg.poll_interval)
                 continue

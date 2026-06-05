@@ -183,6 +183,29 @@ class ManagementClient:
         )
         resp.raise_for_status()
 
+    # --- model push (fetch-to-local) -------------------------------------
+    def upload_model_file(self, session_id: str, rel_path: str, file_path: str) -> None:
+        """Stream one model file up to management under models/{session_id}/{rel_path}."""
+        with open(file_path, "rb") as f:
+            headers = self._headers()
+            # raw bytes, not JSON; rel path travels in a header
+            headers["Content-Type"] = "application/octet-stream"
+            headers["X-Rel-Path"] = rel_path
+            resp = self.session.post(
+                self._agent(f"/sessions/{session_id}/model-file"),
+                data=f, headers=headers, timeout=self.timeout,
+            )
+            resp.raise_for_status()
+
+    def report_model_upload_complete(self, session_id: str, ok: bool, message: Optional[str] = None) -> None:
+        """Tell management the model push finished (or failed); clears the request flag."""
+        resp = self.session.post(
+            self._agent(f"/sessions/{session_id}/model-upload-complete"),
+            json={"ok": ok, "message": message},
+            headers=self._headers(), timeout=self.timeout,
+        )
+        resp.raise_for_status()
+
     def download_dataset_fallback(self, session_id: str, dest_path: str) -> None:
         """GET the JSONL via the authenticated endpoint (no direct storage access)."""
         with self.session.get(
