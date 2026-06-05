@@ -40,6 +40,17 @@ def build_dataset(jsonl_path: str, tokenizer, context_length: int):
     texts = [f"{bos}{record_to_text(r)}{eos}" for r in rows if record_to_text(r)]
     LOGGER.info("dataset: %d usable records (of %d)", len(texts), len(rows))
 
+    # An empty corpus (e.g. a reporter with no scraped articles yet) would otherwise
+    # surface as an opaque "IndexError: list index out of range" deep inside the
+    # tokenizer's fast batch path. Fail early with a message that names the cause so
+    # the training log explains itself instead of dumping a tokenizer stack trace.
+    if not texts:
+        raise ValueError(
+            "no usable training records — the selected dataset is empty "
+            "(if you scoped training to a reporter, that reporter has no scraped "
+            "articles yet; scrape it first, or train on all reporters)"
+        )
+
     enc = tokenizer(
         texts,
         truncation=True,

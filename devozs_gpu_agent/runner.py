@@ -88,8 +88,10 @@ def run_inference(job, client):
     is_stub = (job.backend or "").upper() == "STUB"
     try:
         if is_stub:
+            from .inference import split_article
             num_return = params.get("numReturnSequences") or 3
-            outputs = [f"[stub] generated sample {i + 1} for: {job.prompt}" for i in range(num_return)]
+            outputs = [split_article(f"[stub] title {i + 1}. sub-title for {job.prompt}. "
+                                     f"generated paragraph body {i + 1}.") for i in range(num_return)]
         else:
             from .inference import run_inference as _generate
             outputs = _generate(

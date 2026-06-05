@@ -34,6 +34,28 @@ _SPECIAL_TOKENS = {
 _CACHE: dict = {}
 
 
+def split_article(text: str) -> dict:
+    """Parse a generated sample into ``{title, subTitle, paragraph}``.
+
+    Inverts the training framing (``title. subTitle. content``): split on ``.``,
+    the first segment is the title, the second the sub-title, and the rest joined
+    back is the paragraph. When there isn't enough structure (a short/odd sample,
+    or the ``(no decodable text …)`` note) we keep the whole thing as the paragraph
+    so the caller always gets a renderable shape and never crashes on a bad split.
+    """
+    text = (text or "").strip()
+    segments = [s.strip() for s in text.split(".")]
+    while segments and not segments[-1]:
+        segments.pop()
+    if len(segments) >= 3:
+        return {
+            "title": segments[0],
+            "subTitle": segments[1],
+            "paragraph": ". ".join(segments[2:]).strip(),
+        }
+    return {"title": "", "subTitle": "", "paragraph": text}
+
+
 def _looks_like_hub_id(model_ref: str) -> bool:
     """An HF repo id has no URI scheme and isn't an absolute local path."""
     return "://" not in model_ref and not model_ref.startswith("/")
@@ -138,6 +160,18 @@ def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str =
 
     from transformers import AutoModelForCausalLM
 
+    device = _select_device()
+    # On Gaudi, apply optimum-habana's adaptations BEFORE from_pretrained so the
+    # model is instantiated as its Gaudi variant (e.g. GaudiGPTNeoForCausalLM),
+    # whose generate() understands HPU graphs + static shapes. This mirrors the
+    # training backend (hpu_backend.load_tokenizer_and_model) — without it,
+    # generate() runs with dynamic shapes and recompiles the graph every token,
+    # which on a 400+ token run looks like a hang.
+    if device.type == "hpu":
+        from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+        adapt_transformers_to_gaudi()
+        LOGGER.info("applied optimum-habana Gaudi adaptations for inference")
+
     if _looks_like_hub_id(model_ref):
         source = model_ref
         LOGGER.info("loading inference model from HF Hub: %s", source)
@@ -148,7 +182,6 @@ def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str =
     tokenizer = _load_tokenizer(source, base_model)
     model = AutoModelForCausalLM.from_pretrained(source, pad_token_id=tokenizer.eos_token_id)
 
-    device = _select_device()
     model.to(device)
     model.eval()
     LOGGER.info("model on device: %s", device)
@@ -160,7 +193,11 @@ def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str =
 
 
 def generate(loaded, prompt: str, params: dict) -> list:
-    """Generate samples for prompt. params: {temperature, maxLength, numReturnSequences}."""
+    """Generate samples for prompt. params: {temperature, maxLength, numReturnSequences}.
+
+    Returns a list of structured ``{title, subTitle, paragraph}`` dicts (the raw
+    continuation parsed via :func:`split_article`).
+    """
     import time
 
     import torch
@@ -184,40 +221,68 @@ def generate(loaded, prompt: str, params: dict) -> list:
     if input_ids is not None:
         eff_max = min(max_length + len(encoded[0]), 2048)
 
-    # Generation is the long pole — on HPU lazy mode the first run also compiles the
-    # graph. Log start/finish so a slow run is never mistaken for a hang.
+    gen_kwargs = dict(
+        do_sample=True,
+        max_length=eff_max,
+        temperature=temperature,
+        num_return_sequences=num_return,
+    )
+    # On Gaudi, generate with STATIC shapes so the decode graph compiles once and
+    # replays — the default dynamic shapes recompile every token (each new length
+    # is a new shape), which on a long generation stalls for minutes per request.
+    # These kwargs are recognised by optimum-habana's GaudiGenerationConfig; bucket
+    # padding keeps the static length from forcing every run to the full max.
+    if device.type == "hpu":
+        gen_kwargs.update(
+            static_shapes=True,
+            hpu_graphs=True,
+            bucket_size=128,
+            bucket_internal=True,
+            ignore_eos=False,
+        )
+
+    # Generation is the long pole — on HPU the first run also compiles the graph.
+    # Log start/finish so a slow run is never mistaken for a hang.
     LOGGER.info(
         "generating on %s: max_length=%d num_return=%d temperature=%.2f (this can take a while on first run)",
         device, eff_max, num_return, temperature,
     )
     started = time.time()
     with torch.no_grad():
-        outputs = model.generate(
-            input_ids,
-            do_sample=True,
-            max_length=eff_max,
-            temperature=temperature,
-            num_return_sequences=num_return,
-        )
+        outputs = model.generate(input_ids, **gen_kwargs)
+    if device.type == "hpu":
+        import habana_frameworks.torch.core as htcore
+        htcore.mark_step()
     LOGGER.info("generate finished in %.1fs (%d sequence(s))", time.time() - started, len(outputs))
+
+    # Under HPU static shapes the prompt is padded to a bucket length, so slicing
+    # by the unpadded prompt_len would misalign. Instead decode the full sequence
+    # (skip_special_tokens drops pad/bos/eos) and strip the decoded prompt prefix —
+    # padding-agnostic. CPU/CUDA keep the exact, already-tested token-slice path.
+    prompt_text = tokenizer.decode(encoded[0], skip_special_tokens=True).strip() if input_ids is not None else ""
 
     samples = []
     for i, out in enumerate(outputs):
-        # Decode only the generated continuation (drop the echoed prompt tokens).
-        gen_ids = out[prompt_len:] if int(out.size()[-1]) > prompt_len else out
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        if device.type == "hpu":
+            full = tokenizer.decode(out, skip_special_tokens=True).strip()
+            text = full[len(prompt_text):].lstrip() if prompt_text and full.startswith(prompt_text) else full
+            gen_count = max(int(out.size()[-1]) - prompt_len, 0)
+        else:
+            # Decode only the generated continuation (drop the echoed prompt tokens).
+            gen_ids = out[prompt_len:] if int(out.size()[-1]) > prompt_len else out
+            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            gen_count = int(out.size()[-1]) - prompt_len
         cut = text.find(STOP_TOKEN)
         if cut != -1:
             text = text[:cut]
         text = text.strip()
-        gen_count = int(out.size()[-1]) - prompt_len
         LOGGER.info("generate: sample %d — %d generated token(s), %d char(s): %.80r",
                     i + 1, gen_count, len(text), text)
         if not text:
             text = (f"(no decodable text — the model generated {gen_count} token(s) that "
                     f"decoded to nothing; the base model is likely undertrained or its "
                     f"tokenizer can't represent this prompt's language)")
-        samples.append(text)
+        samples.append(split_article(text))
     return samples
 
 

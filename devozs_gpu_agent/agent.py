@@ -11,6 +11,8 @@ import os
 import time
 from urllib.parse import urlparse
 
+import requests
+
 from .backends import make_backend
 from .config import AgentConfig
 from .management_client import ManagementClient
@@ -18,6 +20,20 @@ from .preflight import run_preflight
 from .runner import run_job
 
 LOGGER = logging.getLogger(__name__)
+
+# Cap for the transient-outage backoff so a long management downtime settles into a
+# steady ~1/min retry instead of growing unbounded — and recovers promptly once it's
+# back (the next success resets the backoff).
+_MAX_BACKOFF_SECONDS = 60.0
+
+
+def _root_cause(exc: Exception) -> str:
+    """Innermost exception message — the useful line, not the requests/urllib3 wrapper."""
+    cur = exc
+    while cur.__cause__ or cur.__context__:
+        cur = cur.__cause__ or cur.__context__
+    msg = str(cur).strip()
+    return msg or type(exc).__name__
 
 
 def _detect_capabilities(cfg: AgentConfig) -> str:
@@ -100,9 +116,13 @@ def run(cfg: AgentConfig = None) -> None:
     ready = _do_preflight(cfg, client)
 
     LOGGER.info("agent up; polling every %.1fs (stub=%s, ready=%s)", cfg.poll_interval, cfg.stub, ready)
+    # Backoff state for transient management outages: grows on consecutive network
+    # failures (so we don't hammer a down server), resets on the first success.
+    backoff_strikes = 0
     while True:
         try:
             ack = client.heartbeat("IDLE")
+            backoff_strikes = 0  # management answered — clear any backoff
             # Admin asked for a fresh check: re-run preflight and report.
             if isinstance(ack, dict) and ack.get("reverifyRequested"):
                 ready = _do_preflight(cfg, client)
@@ -131,7 +151,16 @@ def run(cfg: AgentConfig = None) -> None:
         except KeyboardInterrupt:
             LOGGER.info("agent shutting down")
             return
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # Management briefly unreachable (restart/redeploy/blip): "Connection
+            # refused", a connect timeout, or DNS failure. Expected and self-healing
+            # — log a concise one-liner (not a 25-line stack trace that reads like a
+            # crash) and back off with a cap so we don't hammer a down server.
+            backoff_strikes += 1
+            delay = min(cfg.poll_interval * (2 ** (backoff_strikes - 1)), _MAX_BACKOFF_SECONDS)
+            LOGGER.warning("management unreachable (%s); retry in %.0fs", _root_cause(e), delay)
+            time.sleep(delay)
         except Exception:
-            # Transient management/network problem; back off and keep polling.
+            # An UNEXPECTED error (bug, bad response, etc.) — keep the full traceback.
             LOGGER.warning("poll loop error; backing off", exc_info=True)
             time.sleep(cfg.poll_interval)
