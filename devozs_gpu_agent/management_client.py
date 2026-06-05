@@ -34,6 +34,13 @@ class AgentJob:
     model_key_prefix: str
     push_to_hub: bool
 
+    # job kind: "TRAIN" (default, back-compat) or "INFER". An INFER job ignores the
+    # dataset/hyperparams/checkpoint fields and uses model_ref/prompt/inference_params.
+    kind: str = "TRAIN"
+    model_ref: Optional[str] = None        # trained model: HF Hub id or file://-/s3:// URI
+    prompt: Optional[str] = None
+    inference_params: str = "{}"           # JSON: {temperature, maxLength, numReturnSequences}
+
     @classmethod
     def from_json(cls, j: dict) -> "AgentJob":
         return cls(
@@ -51,6 +58,10 @@ class AgentJob:
             checkpoint_key_prefix=j.get("checkpointKeyPrefix") or "",
             model_key_prefix=j.get("modelKeyPrefix") or "",
             push_to_hub=bool(j.get("pushToHub")),
+            kind=j.get("kind") or "TRAIN",
+            model_ref=j.get("modelRef"),
+            prompt=j.get("prompt"),
+            inference_params=j.get("inferenceParams") or "{}",
         )
 
 
@@ -156,6 +167,18 @@ class ManagementClient:
         resp = self.session.post(
             self._agent(f"/sessions/{session_id}/error"),
             json={"errorType": error_type, "message": message},
+            headers=self._headers(), timeout=self.timeout,
+        )
+        resp.raise_for_status()
+
+    # --- inference result (INFER jobs) -----------------------------------
+    def report_inference_result(self, run_id: str, outputs: Optional[list],
+                                error_type: Optional[str] = None,
+                                message: Optional[str] = None) -> None:
+        """POST the generated samples (or an error) for an INFER job back to management."""
+        resp = self.session.post(
+            self._agent(f"/inference/{run_id}/result"),
+            json={"outputs": outputs, "errorType": error_type, "message": message},
             headers=self._headers(), timeout=self.timeout,
         )
         resp.raise_for_status()
