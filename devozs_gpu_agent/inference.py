@@ -137,6 +137,8 @@ def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str =
 
 def generate(loaded, prompt: str, params: dict) -> list:
     """Generate samples for prompt. params: {temperature, maxLength, numReturnSequences}."""
+    import time
+
     import torch
 
     temperature = (params.get("temperature") or 50) / 100
@@ -153,6 +155,13 @@ def generate(loaded, prompt: str, params: dict) -> list:
     if input_ids is not None:
         eff_max = min(max_length + len(encoded[0]), 2048)
 
+    # Generation is the long pole — on HPU lazy mode the first run also compiles the
+    # graph. Log start/finish so a slow run is never mistaken for a hang.
+    LOGGER.info(
+        "generating on %s: max_length=%d num_return=%d temperature=%.2f (this can take a while on first run)",
+        device, eff_max, num_return, temperature,
+    )
+    started = time.time()
     with torch.no_grad():
         outputs = model.generate(
             input_ids,
@@ -161,6 +170,7 @@ def generate(loaded, prompt: str, params: dict) -> list:
             temperature=temperature,
             num_return_sequences=num_return,
         )
+    LOGGER.info("generate finished in %.1fs (%d sequence(s))", time.time() - started, len(outputs))
 
     samples = []
     for out in outputs:
