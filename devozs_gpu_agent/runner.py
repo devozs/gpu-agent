@@ -36,6 +36,7 @@ def run_job(job, client, work_dir):
     client.report_log(job.session_id, "INFO", f"starting job on {backend.name} backend")
     callback = ManagementProgressCallback(client, storage, job.session_id)
 
+    tokenizer = None
     if is_stub:
         trainer = backend.build_trainer(job, None, None, None, None, output_dir, [callback])
     else:
@@ -71,7 +72,7 @@ def run_job(job, client, work_dir):
         return
 
     # Persist the final model and report completion.
-    output_ref = _publish_model(job, trainer, storage, output_dir, is_stub, client)
+    output_ref = _publish_model(job, trainer, storage, output_dir, is_stub, client, tokenizer)
     client.complete(job.session_id, output_ref, None)
 
 
@@ -94,6 +95,7 @@ def run_inference(job, client):
             outputs = _generate(
                 job.model_ref, job.prompt, params,
                 storage_kind=job.storage_kind, model_key_prefix=job.model_key_prefix,
+                base_model=job.base_model,
             )
         client.report_inference_result(job.session_id, outputs)
         LOGGER.info("inference run %s reported %d sample(s)", job.session_id, len(outputs))
@@ -105,8 +107,13 @@ def run_inference(job, client):
             LOGGER.warning("could not report inference error", exc_info=True)
 
 
-def _publish_model(job, trainer, storage, output_dir, is_stub, client):
+def _publish_model(job, trainer, storage, output_dir, is_stub, client, tokenizer=None):
     trainer.save_model(output_dir)
+    # Save the tokenizer next to the weights so the published model dir is
+    # self-contained — inference loads AutoTokenizer.from_pretrained(model_dir)
+    # and would fail (vocab_file=None) on a weights-only directory.
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output_dir)
     storage_ref = storage.upload_model(output_dir)
     client.report_log(job.session_id, "INFO", f"model uploaded to {storage_ref}")
 

@@ -19,6 +19,16 @@ LOGGER = logging.getLogger(__name__)
 
 STOP_TOKEN = "<|endoftext|>"
 
+# Special tokens the training backends add to the base tokenizer before resizing
+# the model embeddings. A model dir saved without its tokenizer is reconstructed
+# from the base model with these EXACT tokens so len(tokenizer) matches the
+# trained embedding size (see backends.cuda_backend / hpu_backend).
+_SPECIAL_TOKENS = {
+    "bos_token": "<|startoftext|>",
+    "eos_token": "<|endoftext|>",
+    "pad_token": "<|pad|>",
+}
+
 # Single-entry cache: {model_ref: (tokenizer, model, device)}. Bounded to one so a
 # long-lived agent testing several models doesn't accumulate them in memory.
 _CACHE: dict = {}
@@ -73,12 +83,36 @@ def _select_device():
     return torch.device("cpu")
 
 
-def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str = None):
+def _load_tokenizer(source: str, base_model: str = None):
+    """Load the tokenizer from the model dir, falling back to the base model.
+
+    A trained model published before the tokenizer was saved alongside it has no
+    vocab files, so ``AutoTokenizer.from_pretrained(source)`` raises (vocab_file is
+    None). In that case we rebuild the tokenizer from ``base_model`` with the same
+    special tokens the trainer used — that's what the model's embeddings were
+    resized to, so it stays consistent.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(source)
+    except Exception:
+        if not base_model:
+            raise
+        LOGGER.warning(
+            "no tokenizer in %s; falling back to base model %s with training special tokens",
+            source, base_model,
+        )
+        return AutoTokenizer.from_pretrained(base_model, **_SPECIAL_TOKENS)
+
+
+def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str = None,
+               base_model: str = None):
     """Load (tokenizer, model, device), caching by model_ref."""
     if model_ref in _CACHE:
         return _CACHE[model_ref]
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
     if _looks_like_hub_id(model_ref):
         source = model_ref
@@ -87,7 +121,7 @@ def load_model(model_ref: str, storage_kind: str = None, model_key_prefix: str =
         source = _resolve_local_dir(model_ref)
         LOGGER.info("loading inference model from %s", source)
 
-    tokenizer = AutoTokenizer.from_pretrained(source)
+    tokenizer = _load_tokenizer(source, base_model)
     model = AutoModelForCausalLM.from_pretrained(source, pad_token_id=tokenizer.eos_token_id)
 
     device = _select_device()
@@ -139,7 +173,8 @@ def generate(loaded, prompt: str, params: dict) -> list:
 
 
 def run_inference(model_ref: str, prompt: str, params: dict,
-                  storage_kind: str = None, model_key_prefix: str = None) -> list:
+                  storage_kind: str = None, model_key_prefix: str = None,
+                  base_model: str = None) -> list:
     """Convenience: load (cached) + generate. Returns the list of sample strings."""
-    loaded = load_model(model_ref, storage_kind, model_key_prefix)
+    loaded = load_model(model_ref, storage_kind, model_key_prefix, base_model)
     return generate(loaded, prompt, params)
