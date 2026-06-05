@@ -88,13 +88,19 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
         root = urlparse(source_uri).path
         if not os.path.isdir(root):
             raise FileNotFoundError(f"model dir not found on this box: {root}")
+        # Pre-walk so management knows the totals up front and can show a live
+        # fraction ("3/8 files, 40/210 MB") instead of an opaque "uploading".
+        paths = [os.path.join(dp, n) for dp, _d, fs in os.walk(root) for n in fs]
+        files_total = len(paths)
+        bytes_total = sum(os.path.getsize(p) for p in paths)
+        LOGGER.info("pushing model for session %s: %d file(s), %d byte(s) from %s",
+                    session_id, files_total, bytes_total, root)
         count = 0
-        for dirpath, _dirs, files in os.walk(root):
-            for name in files:
-                fpath = os.path.join(dirpath, name)
-                rel = os.path.relpath(fpath, root)
-                client.upload_model_file(session_id, rel, fpath)
-                count += 1
+        for fpath in paths:
+            rel = os.path.relpath(fpath, root)
+            client.upload_model_file(session_id, rel, fpath, files_total, bytes_total)
+            count += 1
+            LOGGER.info("pushed %d/%d: %s", count, files_total, rel)
         client.report_model_upload_complete(session_id, True)
         LOGGER.info("pushed model for session %s (%d file(s)) to management", session_id, count)
     except Exception as e:

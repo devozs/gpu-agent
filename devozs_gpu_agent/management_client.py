@@ -184,13 +184,21 @@ class ManagementClient:
         resp.raise_for_status()
 
     # --- model push (fetch-to-local) -------------------------------------
-    def upload_model_file(self, session_id: str, rel_path: str, file_path: str) -> None:
-        """Stream one model file up to management under models/{session_id}/{rel_path}."""
+    def upload_model_file(self, session_id: str, rel_path: str, file_path: str,
+                          files_total: int = None, bytes_total: int = None) -> None:
+        """Stream one model file up to management under models/{session_id}/{rel_path}.
+
+        files_total/bytes_total are the whole-dir pre-walk totals; sent with each
+        file so management can render a live fetch fraction in the monitor."""
         with open(file_path, "rb") as f:
             headers = self._headers()
             # raw bytes, not JSON; rel path travels in a header
             headers["Content-Type"] = "application/octet-stream"
             headers["X-Rel-Path"] = rel_path
+            if files_total is not None:
+                headers["X-Files-Total"] = str(files_total)
+            if bytes_total is not None:
+                headers["X-Bytes-Total"] = str(bytes_total)
             resp = self.session.post(
                 self._agent(f"/sessions/{session_id}/model-file"),
                 data=f, headers=headers, timeout=self.timeout,
