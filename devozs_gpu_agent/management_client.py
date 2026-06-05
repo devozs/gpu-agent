@@ -184,6 +184,16 @@ class ManagementClient:
         resp.raise_for_status()
 
     # --- model push (fetch-to-local) -------------------------------------
+    def model_manifest(self, session_id: str) -> dict:
+        """Files management already holds for this model: {rel_path: size}. Lets the
+        push resume — we skip files that already landed at the right size."""
+        resp = self.session.get(
+            self._agent(f"/sessions/{session_id}/model-manifest"),
+            headers=self._headers(), timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json() or {}
+
     def upload_model_file(self, session_id: str, rel_path: str, file_path: str,
                           files_total: int = None, bytes_total: int = None) -> None:
         """Stream one model file up to management under models/{session_id}/{rel_path}.

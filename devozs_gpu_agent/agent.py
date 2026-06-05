@@ -93,16 +93,37 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
         paths = [os.path.join(dp, n) for dp, _d, fs in os.walk(root) for n in fs]
         files_total = len(paths)
         bytes_total = sum(os.path.getsize(p) for p in paths)
-        LOGGER.info("pushing model for session %s: %d file(s), %d byte(s) from %s",
-                    session_id, files_total, bytes_total, root)
+
+        # Resume support: ask management what it already holds and skip files that
+        # already landed at the exact size. A fetch interrupted mid-push then only
+        # re-sends the missing/partial files instead of starting over. ("From scratch"
+        # is handled server-side by wiping the dir first, so the manifest comes back
+        # empty and every file is re-sent.) Best-effort: if the manifest call fails we
+        # just upload everything.
+        try:
+            have = client.model_manifest(session_id)
+        except Exception:
+            LOGGER.warning("could not read model manifest; uploading all files", exc_info=True)
+            have = {}
+
+        LOGGER.info("pushing model for session %s: %d file(s), %d byte(s) from %s (%d already present)",
+                    session_id, files_total, bytes_total, root, len(have))
         count = 0
+        skipped = 0
         for fpath in paths:
             rel = os.path.relpath(fpath, root)
+            # os.walk yields OS-separated paths; the manifest keys are '/'-joined.
+            rel_key = rel.replace(os.sep, "/")
+            if have.get(rel_key) == os.path.getsize(fpath):
+                skipped += 1
+                LOGGER.info("skip %s (already present, %d bytes)", rel_key, os.path.getsize(fpath))
+                continue
             client.upload_model_file(session_id, rel, fpath, files_total, bytes_total)
             count += 1
-            LOGGER.info("pushed %d/%d: %s", count, files_total, rel)
+            LOGGER.info("pushed %d/%d: %s", count + skipped, files_total, rel)
         client.report_model_upload_complete(session_id, True)
-        LOGGER.info("pushed model for session %s (%d file(s)) to management", session_id, count)
+        LOGGER.info("pushed model for session %s (%d uploaded, %d skipped, %d total) to management",
+                    session_id, count, skipped, files_total)
     except Exception as e:
         LOGGER.exception("model push for session %s failed", session_id)
         try:
