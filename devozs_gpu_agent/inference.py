@@ -83,24 +83,48 @@ def _select_device():
     return torch.device("cpu")
 
 
+# Files that indicate a real tokenizer was saved in a model dir. Without one of
+# these, AutoTokenizer.from_pretrained(dir) does NOT raise — it builds a degenerate
+# empty tokenizer (len ~1) from config.json, which can't encode/decode anything.
+_TOKENIZER_FILES = (
+    "tokenizer.json", "vocab.json", "vocab.txt", "spiece.model",
+    "tokenizer.model", "merges.txt", "tokenizer_config.json",
+)
+
+
+def _dir_has_tokenizer(source: str) -> bool:
+    """True only if a local dir actually contains tokenizer files (not just config)."""
+    if not os.path.isdir(source):
+        return True  # an HF hub id / remote ref — let from_pretrained handle it
+    return any(os.path.exists(os.path.join(source, f)) for f in _TOKENIZER_FILES)
+
+
 def _load_tokenizer(source: str, base_model: str = None):
     """Load the tokenizer from the model dir, falling back to the base model.
 
-    A trained model published before the tokenizer was saved alongside it has no
-    vocab files, so ``AutoTokenizer.from_pretrained(source)`` raises (vocab_file is
-    None). In that case we rebuild the tokenizer from ``base_model`` with the same
-    special tokens the trainer used — that's what the model's embeddings were
-    resized to, so it stays consistent.
+    A model published before the tokenizer was saved alongside it has no vocab
+    files. Crucially, ``AutoTokenizer.from_pretrained(dir)`` does NOT raise in that
+    case — it builds a degenerate empty tokenizer (len ~1) from config.json, which
+    silently encodes the prompt to one unknown token and decodes everything to ''.
+    So we must detect the missing-tokenizer case up front (not just on exception)
+    and rebuild from ``base_model`` with the same special tokens the trainer used —
+    that's what the model's embeddings were resized to, so it stays consistent.
     """
     from transformers import AutoTokenizer
 
+    if base_model and not _dir_has_tokenizer(source):
+        LOGGER.warning(
+            "no tokenizer files in %s; falling back to base model %s with training special tokens",
+            source, base_model,
+        )
+        return AutoTokenizer.from_pretrained(base_model, **_SPECIAL_TOKENS)
     try:
         return AutoTokenizer.from_pretrained(source)
     except Exception:
         if not base_model:
             raise
         LOGGER.warning(
-            "no tokenizer in %s; falling back to base model %s with training special tokens",
+            "tokenizer load from %s failed; falling back to base model %s",
             source, base_model,
         )
         return AutoTokenizer.from_pretrained(base_model, **_SPECIAL_TOKENS)
