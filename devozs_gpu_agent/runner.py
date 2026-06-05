@@ -21,6 +21,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run_job(job, client, work_dir):
+    # INFER jobs are a forward pass only — no dataset, no trainer, no checkpoints.
+    # They report to a different endpoint, so branch before any training setup.
+    if getattr(job, "kind", "TRAIN") == "INFER":
+        return run_inference(job, client)
     session_dir = os.path.join(work_dir, job.session_id)
     output_dir = os.path.join(session_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
@@ -69,6 +73,36 @@ def run_job(job, client, work_dir):
     # Persist the final model and report completion.
     output_ref = _publish_model(job, trainer, storage, output_dir, is_stub, client)
     client.complete(job.session_id, output_ref, None)
+
+
+def run_inference(job, client):
+    """Run one INFER job: load the trained model, generate, and report the samples.
+
+    Errors are reported via the inference result endpoint (NOT the training
+    /error path, whose id is a training_session). We swallow the exception after
+    reporting so the agent's outer handler doesn't also POST to /error with an
+    inference_run id — that endpoint would 500 on the ownership lookup.
+    """
+    params = json.loads(job.inference_params or "{}")
+    is_stub = (job.backend or "").upper() == "STUB"
+    try:
+        if is_stub:
+            num_return = params.get("numReturnSequences") or 3
+            outputs = [f"[stub] generated sample {i + 1} for: {job.prompt}" for i in range(num_return)]
+        else:
+            from .inference import run_inference as _generate
+            outputs = _generate(
+                job.model_ref, job.prompt, params,
+                storage_kind=job.storage_kind, model_key_prefix=job.model_key_prefix,
+            )
+        client.report_inference_result(job.session_id, outputs)
+        LOGGER.info("inference run %s reported %d sample(s)", job.session_id, len(outputs))
+    except Exception as e:
+        LOGGER.exception("inference run %s failed", job.session_id)
+        try:
+            client.report_inference_result(job.session_id, None, "INTERNAL", str(e))
+        except Exception:
+            LOGGER.warning("could not report inference error", exc_info=True)
 
 
 def _publish_model(job, trainer, storage, output_dir, is_stub, client):
