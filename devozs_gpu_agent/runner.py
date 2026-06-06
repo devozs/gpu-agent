@@ -21,6 +21,11 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run_job(job, client, work_dir):
+    """Run one claimed job to a terminal state and return which one was reported:
+    "complete" | "stopped" for TRAIN, "inference" | "inference_error" for INFER.
+    The caller (child_runner) uses this to tell the parent the job ended cleanly,
+    so the parent only synthesizes an error when the child died without reporting.
+    """
     # INFER jobs are a forward pass only — no dataset, no trainer, no checkpoints.
     # They report to a different endpoint, so branch before any training setup.
     if getattr(job, "kind", "TRAIN") == "INFER":
@@ -69,11 +74,12 @@ def run_job(job, client, work_dir):
     if getattr(trainer.state, "agent_stopped", False):
         client.report_stopped(job.session_id)
         client.report_log(job.session_id, "INFO", "stopped cooperatively; checkpoint retained")
-        return
+        return "stopped"
 
     # Persist the final model and report completion.
     output_ref = _publish_model(job, trainer, storage, output_dir, is_stub, client, tokenizer)
     client.complete(job.session_id, output_ref, None)
+    return "complete"
 
 
 def run_inference(job, client):
@@ -101,12 +107,14 @@ def run_inference(job, client):
             )
         client.report_inference_result(job.session_id, outputs)
         LOGGER.info("inference run %s reported %d sample(s)", job.session_id, len(outputs))
+        return "inference"
     except Exception as e:
         LOGGER.exception("inference run %s failed", job.session_id)
         try:
             client.report_inference_result(job.session_id, None, "INTERNAL", str(e))
         except Exception:
             LOGGER.warning("could not report inference error", exc_info=True)
+        return "inference_error"
 
 
 def _publish_model(job, trainer, storage, output_dir, is_stub, client, tokenizer=None):

@@ -7,6 +7,7 @@ error so the session fails cleanly rather than hanging until the reaper.
 """
 import json
 import logging
+import multiprocessing
 import os
 import threading
 import time
@@ -15,10 +16,10 @@ from urllib.parse import urlparse
 import requests
 
 from .backends import make_backend
+from .child_runner import run_job_child
 from .config import AgentConfig
 from .management_client import ManagementClient
 from .preflight import run_preflight
-from .runner import run_job
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +27,85 @@ LOGGER = logging.getLogger(__name__)
 # steady ~1/min retry instead of growing unbounded — and recovers promptly once it's
 # back (the next success resets the backoff).
 _MAX_BACKOFF_SECONDS = 60.0
+
+# Grace period after SIGTERM before we SIGKILL a child that ignores it.
+_TERMINATE_GRACE_SECONDS = 30.0
+
+# "spawn" (not the default "fork" on Linux): a fork would inherit the parent's
+# requests.Session sockets and any imported accelerator runtime state — both unsafe.
+# spawn gives the child a clean interpreter that builds its own client and imports
+# torch/habana fresh. One shared context for every job we launch.
+_MP = multiprocessing.get_context("spawn")
+
+
+def _device_env_for(cfg: AgentConfig) -> dict:
+    """Accelerator env to hand the child, applied before it imports the ML stack.
+
+    HPU needs lazy mode on explicitly (SynapseAI defaults to eager); both backends
+    pass through any device-visibility pin and HF credentials. Values default to the
+    parent's environment, so a box-wide setting still flows through unless overridden.
+    """
+    env = {}
+    if (cfg.type or "").upper() == "HPU":
+        env["PT_HPU_LAZY_MODE"] = os.getenv("PT_HPU_LAZY_MODE", "1")
+    for key in ("HABANA_VISIBLE_MODULES", "CUDA_VISIBLE_DEVICES", "HF_TOKEN", "HF_HUB_NAMESPACE"):
+        if os.getenv(key) is not None:
+            env[key] = os.getenv(key)
+    return env
+
+
+class JobProcess:
+    """A single in-flight compute job running in a spawned child process.
+
+    Wraps the multiprocessing.Process plus the result queue the child reports its
+    terminal outcome on. The parent never waits on it: it polls is_alive() each loop
+    and finalizes once it exits (see _finalize_job)."""
+
+    def __init__(self, proc, session_id, kind, result_queue):
+        self.proc = proc
+        self.session_id = session_id
+        self.kind = kind
+        self.result_queue = result_queue
+
+    @classmethod
+    def spawn(cls, job, token: str, cfg: AgentConfig) -> "JobProcess":
+        result_queue = _MP.SimpleQueue()
+        proc = _MP.Process(
+            target=run_job_child,
+            args=(job, token, _device_env_for(cfg), result_queue),
+            name=f"job-{job.session_id}",
+            daemon=False,
+        )
+        proc.start()
+        return cls(proc, job.session_id, getattr(job, "kind", "TRAIN"), result_queue)
+
+    def is_alive(self) -> bool:
+        return self.proc.is_alive()
+
+    @property
+    def exitcode(self):
+        return self.proc.exitcode
+
+    def reported_terminal(self):
+        """The terminal kind the child put on the queue, or None if it died silent."""
+        if not self.result_queue.empty():
+            try:
+                kind, _sid = self.result_queue.get()
+                return kind
+            except Exception:
+                return None
+        return None
+
+    def terminate(self, grace: float = _TERMINATE_GRACE_SECONDS) -> None:
+        """Hard cancel: SIGTERM, wait out the grace period, then SIGKILL."""
+        if not self.proc.is_alive():
+            return
+        self.proc.terminate()  # SIGTERM
+        self.proc.join(grace)
+        if self.proc.is_alive():
+            LOGGER.warning("job %s ignored SIGTERM; killing", self.session_id)
+            self.proc.kill()  # SIGKILL
+            self.proc.join(5.0)
 
 
 def _root_cause(exc: Exception) -> str:
@@ -168,6 +248,32 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
             LOGGER.warning("could not report model upload failure", exc_info=True)
 
 
+def _finalize_job(job_proc: "JobProcess", client: ManagementClient) -> None:
+    """Reap a finished compute child and guarantee its session reaches a terminal
+    state. The happy path is the child already POSTed complete/stopped/error and
+    told us via the queue — then there's nothing to do. The crash path is a child
+    that OOMed/segfaulted/was killed without reporting: we synthesize the terminal
+    report here so the session fails immediately instead of waiting for the reaper."""
+    kind = job_proc.reported_terminal()
+    code = job_proc.exitcode
+    if kind is not None:
+        LOGGER.info("session %s finished (%s, exit=%s)", job_proc.session_id, kind, code)
+        return
+    # Child ended without reporting. exit==0 with no report shouldn't happen, but we
+    # still terminate the session defensively rather than leave it hanging.
+    msg = f"job process exited {code} without reporting a terminal state"
+    LOGGER.warning("session %s: %s — reporting failure", job_proc.session_id, msg)
+    try:
+        if job_proc.kind == "INFER":
+            client.report_inference_result(job_proc.session_id, None, "INTERNAL", msg)
+        else:
+            client.report_error(job_proc.session_id, "INTERNAL", msg)
+    except Exception:
+        # Couldn't reach management; the next heartbeat restores liveness and the
+        # server-side reaper remains the last-resort net.
+        LOGGER.warning("could not report job %s failure", job_proc.session_id, exc_info=True)
+
+
 def run(cfg: AgentConfig = None) -> None:
     cfg = cfg or AgentConfig()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -182,55 +288,75 @@ def run(cfg: AgentConfig = None) -> None:
     # Backoff state for transient management outages: grows on consecutive network
     # failures (so we don't hammer a down server), resets on the first success.
     backoff_strikes = 0
-    # A model push streams GBs over minutes. Run it in a BACKGROUND thread so the
-    # poll loop keeps heartbeating — otherwise management's 60s heartbeat timeout
-    # marks the box OFFLINE for the whole push (the "flapping" the admin saw). The
-    # holder tracks the in-flight push so we neither launch a second one (management
-    # keeps sending modelUploadSessionId until it completes) nor claim a job mid-push.
-    push_thread: threading.Thread = None
+    # The supervisor owns two concurrent activity classes, both decoupled from the
+    # heartbeat so the box never flaps OFFLINE:
+    #  - job_proc: the ONE in-flight compute job (TRAIN/INFER), in its own process.
+    #    BUSY is derived purely from this — a fetch does NOT make the box BUSY.
+    #  - push_threads: fetch-to-local model pushes, one daemon thread per session id.
+    #    A push streams GBs over minutes; running it off the loop keeps heartbeats
+    #    flowing AND lets a fetch run concurrently with a compute job.
+    job_proc: JobProcess = None
+    push_threads: dict[str, threading.Thread] = {}
     while True:
         try:
-            ack = client.heartbeat("IDLE")
+            # BUSY iff a compute job occupies the accelerator. Heartbeat every loop
+            # regardless of fetch/job state — this is what keeps the box online
+            # through the long pre-train phase (model load + dataset download) that
+            # used to block the loop and trip the reaper.
+            status = "BUSY" if (job_proc is not None and job_proc.is_alive()) else "IDLE"
+            ack = client.heartbeat(status)
             backoff_strikes = 0  # management answered — clear any backoff
-            # Admin asked for a fresh check: re-run preflight and report.
-            if isinstance(ack, dict) and ack.get("reverifyRequested"):
-                ready = _do_preflight(cfg, client)
-            pushing = push_thread is not None and push_thread.is_alive()
-            # Admin asked to fetch a trained model to local: push it up in the
-            # background so heartbeats keep flowing. Skip if one is already running.
-            if not pushing and isinstance(ack, dict) and ack.get("modelUploadSessionId"):
-                sid = ack["modelUploadSessionId"]
-                src = ack.get("modelUploadSourceUri")
-                # Dedicated client: requests.Session isn't safe for concurrent use, so
-                # the background push must not share the loop's session for heartbeats.
-                push_client = ManagementClient(cfg.mgmt_url, token=client.token)
-                push_thread = threading.Thread(
-                    target=_push_model, args=(push_client, sid, src),
-                    name=f"push-{sid}", daemon=True)
-                push_thread.start()
-                pushing = True
-            # Don't claim a training/inference job while a push occupies the box.
-            if not ready or pushing:
-                time.sleep(cfg.poll_interval)
-                continue
-            job = client.claim()
-            if job is None:
-                time.sleep(cfg.poll_interval)
-                continue
 
-            LOGGER.info("claimed session %s (backend=%s, resume=%s)", job.session_id, job.backend, job.resume)
-            try:
-                client.heartbeat("BUSY")
-                run_job(job, client, cfg.work_dir)
-                LOGGER.info("session %s finished", job.session_id)
-            except Exception as e:  # job-level failure → report and keep the agent alive
-                LOGGER.exception("session %s failed", job.session_id)
-                try:
-                    client.report_error(job.session_id, "INTERNAL", str(e))
-                except Exception:
-                    LOGGER.warning("could not report job error", exc_info=True)
+            # Admin asked for a fresh check: re-run preflight. Only when idle — a
+            # running job must not be disturbed (and the server rejects reverify on BUSY).
+            if status == "IDLE" and isinstance(ack, dict) and ack.get("reverifyRequested"):
+                ready = _do_preflight(cfg, client)
+
+            # Prune finished pushes (each self-reports completion; this is bookkeeping).
+            for sid in [s for s, t in push_threads.items() if not t.is_alive()]:
+                push_threads.pop(sid, None)
+
+            # Admin asked to fetch a trained model to local: push it up in a background
+            # thread, concurrently with whatever else is running. Dedup per session id
+            # (management keeps sending modelUploadSessionId until the push completes).
+            if isinstance(ack, dict) and ack.get("modelUploadSessionId"):
+                sid = ack["modelUploadSessionId"]
+                if sid not in push_threads:
+                    src = ack.get("modelUploadSourceUri")
+                    # Dedicated client: requests.Session isn't safe for concurrent use,
+                    # so each push gets its own, never sharing the loop's heartbeat session.
+                    push_client = ManagementClient(cfg.mgmt_url, token=client.token)
+                    t = threading.Thread(
+                        target=_push_model, args=(push_client, sid, src),
+                        name=f"push-{sid}", daemon=True)
+                    t.start()
+                    push_threads[sid] = t
+
+            # Reap a finished compute job and make sure its session terminated.
+            if job_proc is not None and not job_proc.is_alive():
+                _finalize_job(job_proc, client)
+                job_proc = None
+
+            # Claim only when ready and no compute job is in flight. A fetch in flight
+            # must NOT block claiming — that's the whole point of decoupling them.
+            if ready and job_proc is None:
+                job = client.claim()
+                if job is not None:
+                    LOGGER.info("claimed session %s (backend=%s, resume=%s)",
+                                job.session_id, job.backend, job.resume)
+                    # Flip the UI to BUSY immediately instead of waiting a full poll.
+                    try:
+                        client.heartbeat("BUSY")
+                    except (requests.ConnectionError, requests.Timeout):
+                        pass  # the next loop's heartbeat will catch up
+                    job_proc = JobProcess.spawn(job, client.token, cfg)
+
+            time.sleep(cfg.poll_interval)
         except KeyboardInterrupt:
             LOGGER.info("agent shutting down")
+            if job_proc is not None and job_proc.is_alive():
+                LOGGER.info("terminating in-flight job %s", job_proc.session_id)
+                job_proc.terminate()
             return
         except (requests.ConnectionError, requests.Timeout) as e:
             # Management briefly unreachable (restart/redeploy/blip): "Connection
