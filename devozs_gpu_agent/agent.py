@@ -8,6 +8,7 @@ error so the session fails cleanly rather than hanging until the reaper.
 import json
 import logging
 import os
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -109,9 +110,19 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
         root = urlparse(source_uri).path
         if not os.path.isdir(root):
             raise FileNotFoundError(f"model dir not found on this box: {root}")
+        # The HF Trainer writes intermediate checkpoint-N/ subdirs into the same
+        # output_dir as the final model, but those hold optimizer/scheduler/RNG state
+        # (optimizer.pt alone is ~2x the model) that inference never loads. Push ONLY
+        # the final model files — skip any checkpoint-* dir — so we don't ship GBs of
+        # useless state (which is also what kept timing out).
+        def _is_checkpoint(path: str) -> bool:
+            rel = os.path.relpath(path, root)
+            return any(part.startswith("checkpoint-") for part in rel.split(os.sep))
+
         # Pre-walk so management knows the totals up front and can show a live
         # fraction ("3/8 files, 40/210 MB") instead of an opaque "uploading".
-        paths = [os.path.join(dp, n) for dp, _d, fs in os.walk(root) for n in fs]
+        paths = [os.path.join(dp, n) for dp, _d, fs in os.walk(root) for n in fs
+                 if not _is_checkpoint(os.path.join(dp, n))]
         files_total = len(paths)
         bytes_total = sum(os.path.getsize(p) for p in paths)
 
@@ -171,6 +182,12 @@ def run(cfg: AgentConfig = None) -> None:
     # Backoff state for transient management outages: grows on consecutive network
     # failures (so we don't hammer a down server), resets on the first success.
     backoff_strikes = 0
+    # A model push streams GBs over minutes. Run it in a BACKGROUND thread so the
+    # poll loop keeps heartbeating — otherwise management's 60s heartbeat timeout
+    # marks the box OFFLINE for the whole push (the "flapping" the admin saw). The
+    # holder tracks the in-flight push so we neither launch a second one (management
+    # keeps sending modelUploadSessionId until it completes) nor claim a job mid-push.
+    push_thread: threading.Thread = None
     while True:
         try:
             ack = client.heartbeat("IDLE")
@@ -178,10 +195,22 @@ def run(cfg: AgentConfig = None) -> None:
             # Admin asked for a fresh check: re-run preflight and report.
             if isinstance(ack, dict) and ack.get("reverifyRequested"):
                 ready = _do_preflight(cfg, client)
-            # Admin asked to fetch a trained model to local: push it up.
-            if isinstance(ack, dict) and ack.get("modelUploadSessionId"):
-                _push_model(client, ack["modelUploadSessionId"], ack.get("modelUploadSourceUri"))
-            if not ready:
+            pushing = push_thread is not None and push_thread.is_alive()
+            # Admin asked to fetch a trained model to local: push it up in the
+            # background so heartbeats keep flowing. Skip if one is already running.
+            if not pushing and isinstance(ack, dict) and ack.get("modelUploadSessionId"):
+                sid = ack["modelUploadSessionId"]
+                src = ack.get("modelUploadSourceUri")
+                # Dedicated client: requests.Session isn't safe for concurrent use, so
+                # the background push must not share the loop's session for heartbeats.
+                push_client = ManagementClient(cfg.mgmt_url, token=client.token)
+                push_thread = threading.Thread(
+                    target=_push_model, args=(push_client, sid, src),
+                    name=f"push-{sid}", daemon=True)
+                push_thread.start()
+                pushing = True
+            # Don't claim a training/inference job while a push occupies the box.
+            if not ready or pushing:
                 time.sleep(cfg.poll_interval)
                 continue
             job = client.claim()
