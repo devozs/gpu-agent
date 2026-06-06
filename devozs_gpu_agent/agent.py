@@ -274,6 +274,28 @@ def _finalize_job(job_proc: "JobProcess", client: ManagementClient) -> None:
         LOGGER.warning("could not report job %s failure", job_proc.session_id, exc_info=True)
 
 
+def _report_cancelled(job_proc: "JobProcess", client: ManagementClient) -> None:
+    """Backstop-report a hard-cancelled (SIGTERM'd) job. The child may not have
+    POSTed anything, so the parent reports for it — UNLESS the child already
+    reached a terminal state on the queue (the completion race: the server freed
+    the box right after the child POSTed complete). In that case the session is
+    already terminal server-side; reporting stopped would wrongly override it."""
+    kind = job_proc.reported_terminal()
+    if kind is not None:
+        LOGGER.info("job %s already reported %s before cancel; not overriding",
+                    job_proc.session_id, kind)
+        return
+    try:
+        if job_proc.kind == "INFER":
+            client.report_inference_result(job_proc.session_id, None, "INTERNAL",
+                                           "cancelled (run deleted)")
+        else:
+            client.report_stopped(job_proc.session_id)
+    except Exception:
+        # Best-effort: the run was likely deleted, so this may 4xx; that's fine.
+        LOGGER.debug("cancel report for %s failed (non-fatal)", job_proc.session_id, exc_info=True)
+
+
 def run(cfg: AgentConfig = None) -> None:
     cfg = cfg or AgentConfig()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -297,6 +319,12 @@ def run(cfg: AgentConfig = None) -> None:
     #    flowing AND lets a fetch run concurrently with a compute job.
     job_proc: JobProcess = None
     push_threads: dict[str, threading.Thread] = {}
+    # Hard-cancel detection: the server frees a deleted job's box immediately
+    # (markIdle clears currentSessionId), so the heartbeat ack stops naming our
+    # session. Confirm over two consecutive heartbeats before killing, so we don't
+    # mistake the brief window where a child is still alive right after it POSTed
+    # complete (the server already freed the box, but the child is exiting cleanly).
+    cancel_strikes = 0
     while True:
         try:
             # BUSY iff a compute job occupies the accelerator. Heartbeat every loop
@@ -311,6 +339,29 @@ def run(cfg: AgentConfig = None) -> None:
             # running job must not be disturbed (and the server rejects reverify on BUSY).
             if status == "IDLE" and isinstance(ack, dict) and ack.get("reverifyRequested"):
                 ready = _do_preflight(cfg, client)
+
+            # Hard cancel (delete-as-kill): a running job whose box the server has
+            # reclaimed. A cooperative stop keeps the box bound (assignedSessionId
+            # unchanged) and is handled in-step by the callback; a DELETE frees it,
+            # so assignedSessionId no longer matches our live job. This is the only
+            # way to abort the pre-train phase or an INFER run (no step callback to
+            # carry stopRequested). After SIGTERM the parent reports the terminal
+            # state as backstop, since a killed child can't POST cleanly.
+            if job_proc is not None and job_proc.is_alive() and isinstance(ack, dict):
+                assigned = ack.get("assignedSessionId")
+                if assigned != job_proc.session_id:
+                    cancel_strikes += 1
+                    if cancel_strikes >= 2:
+                        LOGGER.info("job %s no longer assigned to this box; cancelling",
+                                    job_proc.session_id)
+                        job_proc.terminate()
+                        _report_cancelled(job_proc, client)
+                        job_proc = None
+                        cancel_strikes = 0
+                else:
+                    cancel_strikes = 0
+            else:
+                cancel_strikes = 0
 
             # Prune finished pushes (each self-reports completion; this is bookkeeping).
             for sid in [s for s, t in push_threads.items() if not t.is_alive()]:
