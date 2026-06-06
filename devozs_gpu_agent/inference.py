@@ -232,10 +232,19 @@ def generate(loaded, prompt: str, params: dict) -> list:
     # is a new shape), which on a long generation stalls for minutes per request.
     # These kwargs are recognised by optimum-habana's GaudiGenerationConfig; bucket
     # padding keeps the static length from forcing every run to the full max.
+    #
+    # lazy_mode MUST be passed explicitly: GaudiGenerationConfig.lazy_mode defaults
+    # to False (independent of the PT_HPU_LAZY_MODE runtime env var), and generate()
+    # validates that hpu_graphs implies lazy_mode — otherwise it raises
+    # "`hpu_graphs` is True but `lazy_mode` is False". The training path sets the
+    # equivalent use_lazy_mode=True on GaudiTrainingArguments; this is its inference
+    # counterpart. The agent already exports PT_HPU_LAZY_MODE=1 for HPU, so the
+    # runtime backs this up.
     if device.type == "hpu":
         gen_kwargs.update(
             static_shapes=True,
             hpu_graphs=True,
+            lazy_mode=True,
             bucket_size=128,
             bucket_internal=True,
             ignore_eos=False,
