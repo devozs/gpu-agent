@@ -78,6 +78,27 @@ def _do_preflight(cfg: AgentConfig, client: ManagementClient) -> bool:
     return result.ok
 
 
+def _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_total, attempts=4):
+    """Upload one model file, retrying transient network failures with backoff.
+
+    The push is agent→management over a possibly slow/flaky link; a single file
+    timing out (TimeoutError/Connection aborted) shouldn't abort the whole fetch.
+    Re-sending is safe — management overwrites the file — and the next file's diff
+    still skips anything that did land. Re-raises after the last attempt so the
+    caller reports the push failed (and the UI offers resume)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            client.upload_model_file(session_id, rel, fpath, files_total, bytes_total)
+            return
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 15)
+            LOGGER.warning("upload of %s failed (%s); retry %d/%d in %ds",
+                           rel, _root_cause(e), attempt, attempts - 1, delay)
+            time.sleep(delay)
+
+
 def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> None:
     """Push a trained model dir up to management (fetch-to-local). OUTBOUND-only:
     the agent reads its local file:// model dir and streams each file. Reports
@@ -118,7 +139,11 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
                 skipped += 1
                 LOGGER.info("skip %s (already present, %d bytes)", rel_key, os.path.getsize(fpath))
                 continue
-            client.upload_model_file(session_id, rel, fpath, files_total, bytes_total)
+            # Retry a transient upload failure (timeout / dropped connection) a few
+            # times before giving up on the whole push — one slow file shouldn't
+            # force a manual re-fetch. Management overwrites a partial file on the
+            # retry, so re-sending is safe.
+            _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_total)
             count += 1
             LOGGER.info("pushed %d/%d: %s", count + skipped, files_total, rel)
         client.report_model_upload_complete(session_id, True)

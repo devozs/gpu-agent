@@ -70,6 +70,11 @@ class ManagementClient:
         self.base = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        # Model-file uploads stream hundreds of MB; a single 30s socket timeout
+        # trips mid-body on a slow link (requests applies the scalar timeout to
+        # EACH send/recv, not the whole request). Use a (connect, read/write) tuple:
+        # fail fast if management is unreachable, but allow a long per-chunk write.
+        self.upload_timeout = (10.0, 300.0)
         self.session = requests.Session()
 
     def _headers(self) -> dict:
@@ -211,7 +216,7 @@ class ManagementClient:
                 headers["X-Bytes-Total"] = str(bytes_total)
             resp = self.session.post(
                 self._agent(f"/sessions/{session_id}/model-file"),
-                data=f, headers=headers, timeout=self.timeout,
+                data=f, headers=headers, timeout=self.upload_timeout,
             )
             resp.raise_for_status()
 
