@@ -96,6 +96,16 @@ class ManagementClient:
             headers={"Content-Type": "application/json"},
             timeout=self.timeout,
         )
+        # A rejected enrollment code (invalid / already-used / rotated) comes back
+        # as 401 — turn it into a clear message instead of a raw HTTPError traceback.
+        # Re-issuing the code in the admin UI revokes the previous one, so a stale
+        # ENROLL_CODE in /etc/devozs-gpu-agent.env is the usual cause.
+        if resp.status_code == 401:
+            raise SystemExit(
+                "enrollment rejected (401): the code is invalid, already used, or was "
+                "rotated. Re-issue the code in the admin UI and update ENROLL_CODE in "
+                "/etc/devozs-gpu-agent.env (then re-run bootstrap.sh --force or edit the file)."
+            )
         resp.raise_for_status()
         data = resp.json()
         self.token = data["token"]
