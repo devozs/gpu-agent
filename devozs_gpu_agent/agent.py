@@ -296,7 +296,7 @@ def _report_cancelled(job_proc: "JobProcess", client: ManagementClient) -> None:
         LOGGER.debug("cancel report for %s failed (non-fatal)", job_proc.session_id, exc_info=True)
 
 
-def run(cfg: AgentConfig = None) -> None:
+def run(cfg: AgentConfig = None, enroll_only: bool = False) -> None:
     cfg = cfg or AgentConfig()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     client = ManagementClient(cfg.mgmt_url)
@@ -305,6 +305,14 @@ def run(cfg: AgentConfig = None) -> None:
     # Preflight runs before the poll loop; an unready box keeps heartbeating
     # (so the admin sees it) but will not be handed jobs by management.
     ready = _do_preflight(cfg, client)
+
+    # --enroll-only: enroll (token cached) + one preflight, then exit cleanly so a
+    # setup script can run unattended instead of needing a manual Ctrl+C. The
+    # systemd service started afterwards reuses the cached token and polls for jobs.
+    if enroll_only:
+        LOGGER.info("enroll-only: enrolled and preflight %s — exiting (ready=%s)",
+                    "OK" if ready else "FAILED", ready)
+        raise SystemExit(0 if ready else 1)
 
     LOGGER.info("agent up; polling every %.1fs (stub=%s, ready=%s)", cfg.poll_interval, cfg.stub, ready)
     # Backoff state for transient management outages: grows on consecutive network

@@ -84,22 +84,25 @@ quick-start — not a generic container.
    trainable in the UI. Section 3 (`--with-hf`) additionally proves the exact
    Hugging Face / optimum-habana path the agent's HPU backend uses.
 
-3. **Install the agent into the Habana venv** without disturbing the matched
-   torch, then enroll once — reading the config `bootstrap.sh` wrote in step 1:
+3. **Install the agent into the Habana venv** (keeps the SynapseAI-matched torch
+   via `--no-deps`; also installs the job deps):
 
    ```bash
-   source ~/habanalabs-venv/bin/activate
-   pip install --no-deps -e /path/to/gpu-agent                 # the agent + requests
-   pip install 'datasets>=2.18' 'boto3>=1.34' optimum-habana   # only needed for a real job
-
-   set -a; . /etc/devozs-gpu-agent.env; set +a                 # MGMT_URL/AGENT_TYPE/ENROLL_CODE + PT_HPU_LAZY_MODE
-   python -m devozs_gpu_agent
+   ./deploy/install-agent.sh            # add --no-job-deps for a verify-only box
    ```
 
-Preflight needs only `requests` + `transformers` + `habana_frameworks` (all
-present after `setup-agent.sh`); `datasets`/`boto3`/`optimum-habana` are imported
-lazily and only when a job actually runs, so the box can reach **READY** before
-they're installed.
+4. **Enroll once.** Reads the config `bootstrap.sh` wrote in step 1, caches the
+   bearer token, runs one readiness preflight, then **exits** (no manual Ctrl+C):
+
+   ```bash
+   ./deploy/enroll.sh
+   ```
+
+   Under the hood this is `python -m devozs_gpu_agent --enroll-only`. Preflight
+   needs only `requests` + `transformers` + `habana_frameworks` (all present after
+   `setup-agent.sh`); `datasets`/`boto3`/`optimum-habana` are imported lazily and
+   only when a job actually runs, so the box can reach **READY** before they're
+   installed (hence `--no-job-deps` is enough to enroll + verify).
 
 ### Run as a systemd service (recommended for a dedicated box)
 
