@@ -35,7 +35,13 @@ die() { printf '\033[1;31mxx %s\033[0m\n' "$*" >&2; exit 1; }
 log() { printf '\033[1;36m== %s\033[0m\n' "$*"; }
 ok()  { printf '\033[1;32m== %s\033[0m\n' "$*"; }
 
-[ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE — run ./deploy/bootstrap.sh first"
+# Distinguish "missing" from "exists but unreadable" — the latter is usually a
+# root-owned file from running bootstrap.sh under sudo on an older version.
+if [ ! -e "$ENV_FILE" ]; then
+  die "$ENV_FILE not found — run ./deploy/bootstrap.sh first"
+elif [ ! -r "$ENV_FILE" ]; then
+  die "$ENV_FILE exists but is not readable by $(id -un) (owner $(stat -c '%U:%G mode %a' "$ENV_FILE" 2>/dev/null)). Fix with: sudo chown $(id -un) $ENV_FILE"
+fi
 
 if [ -z "$VENV" ]; then
   if [ -n "${VIRTUAL_ENV:-}" ]; then VENV="$VIRTUAL_ENV"; else VENV="$HOME/habanalabs-venv"; fi

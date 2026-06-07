@@ -47,7 +47,10 @@ ENV_SRC="$SCRIPT_DIR/${SERVICE_NAME}.env.example"
 MGMT_URL=""
 AGENT_TYPE=""
 ENROLL_CODE=""
-RUN_USER="$(id -un)"
+# This script is run WITH sudo (it writes /etc), so `id -un` would be root and the
+# env file would land root-owned and unreadable by the human user who later runs
+# enroll.sh. Default the owner to the invoking user ($SUDO_USER) when under sudo.
+RUN_USER="${SUDO_USER:-$(id -un)}"
 FORCE=0
 DO_CHECK=1
 CHECK_ONLY=0
