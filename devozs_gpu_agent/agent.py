@@ -20,6 +20,7 @@ from .child_runner import run_job_child
 from .config import AgentConfig
 from .management_client import ManagementClient
 from .preflight import run_preflight
+from .progress_bar import ConsoleBar
 
 LOGGER = logging.getLogger(__name__)
 
@@ -159,6 +160,16 @@ def _do_preflight(cfg: AgentConfig, client: ManagementClient) -> bool:
     return result.ok
 
 
+def _log_remote(client, session_id, level, message):
+    """Best-effort: ship a line to the management Logs panel. Never raises — a
+    failed log post must not abort the push (report_log already swallows errors,
+    but guard here too in case the client itself is unavailable)."""
+    try:
+        client.report_log(session_id, level, message)
+    except Exception:
+        LOGGER.debug("remote log post failed (non-fatal)", exc_info=True)
+
+
 def _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_total, attempts=4):
     """Upload one model file, retrying transient network failures with backoff.
 
@@ -166,12 +177,19 @@ def _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_tota
     timing out (TimeoutError/Connection aborted) shouldn't abort the whole fetch.
     Re-sending is safe — management overwrites the file — and the next file's diff
     still skips anything that did land. Re-raises after the last attempt so the
-    caller reports the push failed (and the UI offers resume)."""
+    caller reports the push failed (and the UI offers resume).
+
+    Draws a tqdm-style per-file bar to the agent console as bytes stream, and
+    returns its finished line so the caller can mirror it into the web Logs."""
     for attempt in range(1, attempts + 1):
+        # Fresh bar per attempt: a retry restarts the file from 0 bytes.
+        bar = ConsoleBar(rel, os.path.getsize(fpath))
         try:
-            client.upload_model_file(session_id, rel, fpath, files_total, bytes_total)
-            return
+            client.upload_model_file(session_id, rel, fpath, files_total, bytes_total,
+                                     on_progress=bar.update)
+            return bar.close()
         except (requests.ConnectionError, requests.Timeout) as e:
+            bar.close(bar.n)  # leave the partial bar on its own line, don't overwrite it
             if attempt == attempts:
                 raise
             delay = min(2 ** (attempt - 1), 15)
@@ -218,25 +236,38 @@ def _push_model(client: ManagementClient, session_id: str, source_uri: str) -> N
             LOGGER.warning("could not read model manifest; uploading all files", exc_info=True)
             have = {}
 
+        from .progress_bar import human_size
         LOGGER.info("pushing model for session %s: %d file(s), %d byte(s) from %s (%d already present)",
                     session_id, files_total, bytes_total, root, len(have))
+        # Mirror a one-line summary into the web Logs so the panel has context
+        # before the per-file bars start streaming in.
+        _log_remote(client, session_id, "INFO",
+                    f"fetching model: {files_total} file(s), {human_size(bytes_total)}B"
+                    + (f" ({len(have)} already present)" if have else ""))
         count = 0
         skipped = 0
         for fpath in paths:
             rel = os.path.relpath(fpath, root)
+            size = os.path.getsize(fpath)
             # os.walk yields OS-separated paths; the manifest keys are '/'-joined.
             rel_key = rel.replace(os.sep, "/")
-            if have.get(rel_key) == os.path.getsize(fpath):
+            if have.get(rel_key) == size:
                 skipped += 1
-                LOGGER.info("skip %s (already present, %d bytes)", rel_key, os.path.getsize(fpath))
+                LOGGER.info("skip %s (already present, %d bytes)", rel_key, size)
+                # Show skipped files as completed bars too — they're part of the model.
+                _log_remote(client, session_id, "INFO",
+                            f"{rel} 100%|{'█' * 24}| {human_size(size)}/{human_size(size)} (already present)")
                 continue
             # Retry a transient upload failure (timeout / dropped connection) a few
             # times before giving up on the whole push — one slow file shouldn't
             # force a manual re-fetch. Management overwrites a partial file on the
             # retry, so re-sending is safe.
-            _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_total)
+            bar_line = _upload_with_retries(client, session_id, rel, fpath, files_total, bytes_total)
             count += 1
             LOGGER.info("pushed %d/%d: %s", count + skipped, files_total, rel)
+            # Mirror the finished tqdm-style bar into the web Logs panel.
+            if bar_line:
+                _log_remote(client, session_id, "INFO", bar_line)
         client.report_model_upload_complete(session_id, True)
         LOGGER.info("pushed model for session %s (%d uploaded, %d skipped, %d total) to management",
                     session_id, count, skipped, files_total)

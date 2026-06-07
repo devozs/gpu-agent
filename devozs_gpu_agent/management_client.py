@@ -5,6 +5,7 @@ management service's training-agent controller. All calls are OUTBOUND; the
 bearer token is attached automatically once enrolled.
 """
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -15,6 +16,35 @@ LOGGER = logging.getLogger(__name__)
 
 class StopRequested(Exception):
     """Raised internally when the server signals a cooperative stop."""
+
+
+class _ProgressReader:
+    """File wrapper that reports bytes read as the upload streams them.
+
+    requests reads the body in chunks via .read(); we forward each chunk and call
+    on_progress(sent, size) so the caller can draw a live per-file bar. We expose
+    __len__ so requests still sends a Content-Length (a bare file object would be
+    sent the same way, but wrapping it would otherwise switch to chunked transfer,
+    which drops the length header the server reads for per-file byte progress)."""
+
+    def __init__(self, fileobj, size, on_progress):
+        self._f = fileobj
+        self._size = size
+        self._on_progress = on_progress
+        self._sent = 0
+
+    def __len__(self):
+        return self._size
+
+    def read(self, amt=-1):
+        chunk = self._f.read(amt)
+        if chunk:
+            self._sent += len(chunk)
+            try:
+                self._on_progress(self._sent, self._size)
+            except Exception:
+                pass  # progress drawing must never break the upload
+        return chunk
 
 
 @dataclass
@@ -210,11 +240,18 @@ class ManagementClient:
         return resp.json() or {}
 
     def upload_model_file(self, session_id: str, rel_path: str, file_path: str,
-                          files_total: int = None, bytes_total: int = None) -> None:
+                          files_total: int = None, bytes_total: int = None,
+                          on_progress=None) -> None:
         """Stream one model file up to management under models/{session_id}/{rel_path}.
 
         files_total/bytes_total are the whole-dir pre-walk totals; sent with each
-        file so management can render a live fetch fraction in the monitor."""
+        file so management can render a live fetch fraction in the monitor.
+
+        on_progress(sent, size), if given, is called as bytes flow up — used to
+        draw a live per-file progress bar. The body is wrapped in a counting
+        reader that still reports Content-Length, so the server keeps getting the
+        per-file size it counts byte progress from."""
+        size = os.path.getsize(file_path)
         with open(file_path, "rb") as f:
             headers = self._headers()
             # raw bytes, not JSON; rel path travels in a header
@@ -224,9 +261,10 @@ class ManagementClient:
                 headers["X-Files-Total"] = str(files_total)
             if bytes_total is not None:
                 headers["X-Bytes-Total"] = str(bytes_total)
+            body = _ProgressReader(f, size, on_progress) if on_progress else f
             resp = self.session.post(
                 self._agent(f"/sessions/{session_id}/model-file"),
-                data=f, headers=headers, timeout=self.upload_timeout,
+                data=body, headers=headers, timeout=self.upload_timeout,
             )
             resp.raise_for_status()
 
