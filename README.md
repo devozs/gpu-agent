@@ -57,7 +57,22 @@ On Gaudi, the SynapseAI userspace (`habana_frameworks` + `torch`) must match the
 host driver **exactly**, so run the agent in the same venv that runs Habana's
 quick-start — not a generic container.
 
-1. **Set up + verify the box** with the bundled script (mirrors
+1. **Write the config + sanity-check reachability** with `bootstrap.sh`. This
+   runs *first* so `/etc/devozs-gpu-agent.env` is the single source of truth for
+   `MGMT_URL` / `AGENT_TYPE` / `ENROLL_CODE`, and the reachability test runs
+   against the real configured URL before you invest in the driver install:
+
+   ```bash
+   sudo ./deploy/bootstrap.sh --mgmt-url http://<mgmt-host>/api --type HPU --enroll-code <code>
+   ```
+
+   It POSTs an empty body to `/training/agent/heartbeat`: a **400/401/2xx**
+   ("REACHABLE") means the URL+port work (the empty body is expected to be
+   rejected); a refused/timeout ("UNREACHABLE") means a wrong URL or a blocked
+   port. High app ports (e.g. `:18080`) are commonly dropped by a firewall while
+   `:80` is redirected to them — prefer the `:80` URL form in that case.
+
+2. **Set up + verify the box** with the bundled script (mirrors
    [`gaudi-vm-setup.md`](gaudi-vm-setup.md)):
 
    ```bash
@@ -69,17 +84,16 @@ quick-start — not a generic container.
    trainable in the UI. Section 3 (`--with-hf`) additionally proves the exact
    Hugging Face / optimum-habana path the agent's HPU backend uses.
 
-2. **Install the agent into the Habana venv** without disturbing the matched
-   torch, then run it:
+3. **Install the agent into the Habana venv** without disturbing the matched
+   torch, then enroll once — reading the config `bootstrap.sh` wrote in step 1:
 
    ```bash
    source ~/habanalabs-venv/bin/activate
    pip install --no-deps -e /path/to/gpu-agent                 # the agent + requests
    pip install 'datasets>=2.18' 'boto3>=1.34' optimum-habana   # only needed for a real job
 
-   export PT_HPU_LAZY_MODE=1                                    # see gaudi-vm-setup.md §3.2
-   ENROLL_CODE=<code> MGMT_URL=http://<mgmt-host>/api AGENT_TYPE=HPU \
-     python -m devozs_gpu_agent
+   set -a; . /etc/devozs-gpu-agent.env; set +a                 # MGMT_URL/AGENT_TYPE/ENROLL_CODE + PT_HPU_LAZY_MODE
+   python -m devozs_gpu_agent
    ```
 
 Preflight needs only `requests` + `transformers` + `habana_frameworks` (all
@@ -100,9 +114,11 @@ auto-restarts on crash:
 ./deploy/install-service.sh
 ```
 
-It auto-detects the venv python, repo dir, and current user; installs an env
-file at `/etc/devozs-gpu-agent.env`; then enables + starts
-`devozs-gpu-agent.service`. Edit `MGMT_URL` / `AGENT_TYPE` there:
+It auto-detects the venv python, repo dir, and current user, then enables +
+starts `devozs-gpu-agent.service`. The env file at `/etc/devozs-gpu-agent.env`
+was already written (with the right `MGMT_URL` / `AGENT_TYPE`) by `bootstrap.sh`
+in step 1, and `install-service.sh` leaves an existing one untouched — so the
+service starts correctly with no further editing. To change a value later:
 
 ```bash
 sudoedit /etc/devozs-gpu-agent.env
