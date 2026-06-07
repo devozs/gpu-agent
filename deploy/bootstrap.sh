@@ -6,8 +6,13 @@
 # the single source of truth for MGMT_URL / AGENT_TYPE / ENROLL_CODE that every
 # later step (foreground enroll, systemd service) reads.
 #
-#   sudo ./deploy/bootstrap.sh --mgmt-url http://10.111.56.26/api \
-#                              --type HPU --enroll-code HRT-xxxx
+#   sudo -E ./deploy/bootstrap.sh --mgmt-url http://10.111.56.26/api \
+#                                 --type HPU --enroll-code HRT-xxxx
+#
+# Use 'sudo -E' (not bare 'sudo') so the proxy your login shell exports
+# (HTTPS_PROXY) survives into this script and gets written to the env file —
+# bare sudo strips it, and the service can't reach huggingface.co without it.
+# Alternatively pass --http-proxy URL explicitly.
 #
 # The sanity check posts an empty body to /training/agent/heartbeat and honours
 # NO_PROXY (so an internal host bypasses any corporate proxy, like the agent will):
@@ -31,6 +36,15 @@
 #   --env-file PATH   source template to start from
 #                     (default: deploy/devozs-gpu-agent.env.example)
 #   --user NAME       own the env file as this user        (default: current user)
+#   --http-proxy URL  corporate proxy for OUTBOUND internet (HuggingFace) egress.
+#                     Defaults to this shell's HTTPS_PROXY/HTTP_PROXY, so on a box
+#                     where `curl https://huggingface.co` already works it is
+#                     captured automatically. Pass '' / --no-proxy to force none.
+#                     REQUIRED whenever the Hub is only reachable via a proxy —
+#                     the systemd service does NOT inherit your login shell, so
+#                     without it real jobs die at from_pretrained() with
+#                     "[Errno 101] Network is unreachable".
+#   --no-proxy        write no proxy lines even if the shell has them set
 #   --force           overwrite an existing /etc/devozs-gpu-agent.env
 #   --skip-check      write the env file but don't run the sanity check
 #   --check-only      only re-run the reachability check (no writing); reads
@@ -47,6 +61,12 @@ ENV_SRC="$SCRIPT_DIR/${SERVICE_NAME}.env.example"
 MGMT_URL=""
 AGENT_TYPE=""
 ENROLL_CODE=""
+# Proxy for outbound internet egress (HuggingFace). Default to whatever this shell
+# already has — on the Intel lab the setup shell exports HTTPS_PROXY, and that's
+# exactly the value the service needs but won't inherit. NO_PROXY_OPT records an
+# explicit --no-proxy so we can distinguish "user wants none" from "shell had none".
+HTTP_PROXY_VAL="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+NO_PROXY_OPT=0
 # This script is run WITH sudo (it writes /etc), so `id -un` would be root and the
 # env file would land root-owned and unreadable by the human user who later runs
 # enroll.sh. Default the owner to the invoking user ($SUDO_USER) when under sudo.
@@ -60,6 +80,8 @@ while [ $# -gt 0 ]; do
     --mgmt-url)    MGMT_URL="$2"; shift 2 ;;
     --type)        AGENT_TYPE="$2"; shift 2 ;;
     --enroll-code) ENROLL_CODE="$2"; shift 2 ;;
+    --http-proxy)  HTTP_PROXY_VAL="$2"; shift 2 ;;
+    --no-proxy)    NO_PROXY_OPT=1; HTTP_PROXY_VAL=""; shift ;;
     --env-file)    ENV_SRC="$2"; shift 2 ;;
     --user)        RUN_USER="$2"; shift 2 ;;
     --force)       FORCE=1; shift ;;
@@ -99,6 +121,7 @@ if [ "$CHECK_ONLY" -ne 1 ]; then
   echo "  mgmt    : $MGMT_URL"
   echo "  type    : $AGENT_TYPE"
   echo "  enroll  : $([ -n "$ENROLL_CODE" ] && echo '<set>' || echo '<none — using cached token>')"
+  echo "  proxy   : $([ -n "$HTTP_PROXY_VAL" ] && echo "$HTTP_PROXY_VAL" || echo '<none — direct internet>')"
   echo "  owner   : $RUN_USER ($RUN_GROUP)"
 
   # --- write the env file ----------------------------------------------------
@@ -120,6 +143,46 @@ if [ "$CHECK_ONLY" -ne 1 ]; then
     else
       printf '\nENROLL_CODE=%s\n' "$ENROLL_CODE" >> "$tmp_env"
     fi
+  fi
+
+  # --- proxy: the one a service-vs-shell trap always hides ---------------------
+  # The systemd service does NOT inherit the login shell, so the HTTPS_PROXY your
+  # setup shell has (the only route to huggingface.co on the lab) must be written
+  # into the env file or every real job dies at from_pretrained() with
+  # "[Errno 101] Network is unreachable". The template ships these COMMENTED; we
+  # uncomment + fill them when a proxy is in play. NO_PROXY always includes the
+  # mgmt host's network so heartbeat/claim traffic bypasses the DMZ proxy (a 10.x
+  # host is covered by 10.0.0.0/8). --no-proxy / an empty value leaves them off.
+  if [ "$NO_PROXY_OPT" -eq 1 ] || [ -z "$HTTP_PROXY_VAL" ]; then
+    warn "no proxy set — the service will reach the internet directly. If huggingface.co"
+    warn "is only reachable via a proxy on this box, re-run with --http-proxy URL or jobs"
+    warn "will fail with '[Errno 101] Network is unreachable' at from_pretrained()."
+    # sudo strips HTTPS_PROXY from the environment, so auto-detect comes up empty
+    # exactly when bootstrap is run the documented way (sudo ./deploy/bootstrap.sh).
+    # Call that out specifically so the user doesn't silently get a proxy-less file.
+    if [ "$NO_PROXY_OPT" -ne 1 ] && [ -n "${SUDO_USER:-}" ]; then
+      warn "  (running under sudo strips the shell's HTTPS_PROXY — if your shell has one,"
+      warn "   re-run with 'sudo -E ./deploy/bootstrap.sh …' or pass --http-proxy URL.)"
+    fi
+  else
+    no_proxy_val="127.0.0.1,localhost,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,.intel.com"
+    # Use '@' as the sed delimiter — proxy URLs contain '/' and ':'.
+    sed -i -E \
+      -e "s@^#?HTTP_PROXY=.*@HTTP_PROXY=${HTTP_PROXY_VAL}@" \
+      -e "s@^#?HTTPS_PROXY=.*@HTTPS_PROXY=${HTTP_PROXY_VAL}@" \
+      -e "s@^#?NO_PROXY=.*@NO_PROXY=${no_proxy_val}@" \
+      "$tmp_env"
+    # The example only carries the upper-case names; some libraries read the
+    # lower-case ones, so append them too (idempotent: replace if already present).
+    for pair in "http_proxy=${HTTP_PROXY_VAL}" "https_proxy=${HTTP_PROXY_VAL}" "no_proxy=${no_proxy_val}"; do
+      key="${pair%%=*}"
+      if grep -qE "^#?${key}=" "$tmp_env"; then
+        sed -i -E "s@^#?${key}=.*@${pair}@" "$tmp_env"
+      else
+        printf '%s\n' "$pair" >> "$tmp_env"
+      fi
+    done
+    ok "proxy → $HTTP_PROXY_VAL (NO_PROXY keeps mgmt + .intel.com direct)"
   fi
 
   sudo cp "$tmp_env" "$ENV_DEST"
