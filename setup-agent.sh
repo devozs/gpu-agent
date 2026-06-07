@@ -18,6 +18,13 @@
 #   ./setup-agent.sh --with-hf       # also section 3 (HF run_glue.py verify)
 #   ./setup-agent.sh --hf-only       # only section 3 (env already set up)
 #   ./setup-agent.sh --skip-driver   # skip 1.1/1.2 install, still verify + MNIST
+#   ./setup-agent.sh -y              # quiet/non-interactive: no approval prompts
+#
+# -y / --yes / --quiet: answer yes to every prompt so the run is unattended —
+#   passes -y to the Habana installer, sets DEBIAN_FRONTEND=noninteractive for the
+#   apt step, and pre-authenticates sudo once up front (it still asks for the sudo
+#   password ONCE at the start unless the user has NOPASSWD; everything after that
+#   runs without stopping to ask).
 #
 # Env overrides:
 #   SYNAPSE_VERSION   SynapseAI version to install      (default 1.24.0)
@@ -47,18 +54,28 @@ INSTALLER="habanalabs-installer.sh"
 WITH_HF=0
 HF_ONLY=0
 SKIP_DRIVER=0
+YES=0
 
 for arg in "$@"; do
   case "$arg" in
-    --with-hf)     WITH_HF=1 ;;
-    --hf-only)     HF_ONLY=1; WITH_HF=1 ;;
-    --skip-driver) SKIP_DRIVER=1 ;;
+    --with-hf)        WITH_HF=1 ;;
+    --hf-only)        HF_ONLY=1; WITH_HF=1 ;;
+    --skip-driver)    SKIP_DRIVER=1 ;;
+    -y|--yes|--quiet) YES=1 ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown arg: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# Non-interactive plumbing. The Habana installer takes -y; apt honours
+# DEBIAN_FRONTEND=noninteractive (passed through to the sudo'd dependencies step).
+INSTALLER_YES=""
+if [ "$YES" -eq 1 ]; then
+  INSTALLER_YES="-y"
+  export DEBIAN_FRONTEND=noninteractive
+fi
 
 log()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
@@ -73,14 +90,15 @@ section_1_install() {
     wget -nv "https://vault.habana.ai/artifactory/gaudi-installer/${SYNAPSE_VERSION}/${INSTALLER}"
     chmod +x "$INSTALLER"
   fi
-  ./"$INSTALLER" install --type base
+  ./"$INSTALLER" install --type base $INSTALLER_YES
 
   log "1.2 Install OS dependencies, then the PyTorch stack (torch + habana_frameworks)"
   # The `base` type installs only the driver/firmware — NOT PyTorch. The
   # `pytorch` install ABORTS (and does not create the venv) if system libs are
-  # missing, so install `dependencies` first. Needs sudo.
-  sudo ./"$INSTALLER" install --type dependencies
-  ./"$INSTALLER" install --type pytorch --venv   # creates $VENV with torch + habana_frameworks
+  # missing, so install `dependencies` first. Needs sudo, and runs apt under the
+  # hood — DEBIAN_FRONTEND keeps apt from prompting in quiet mode.
+  sudo DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-}" ./"$INSTALLER" install --type dependencies $INSTALLER_YES
+  ./"$INSTALLER" install --type pytorch --venv $INSTALLER_YES   # creates $VENV with torch + habana_frameworks
 }
 
 # ===========================================================================
@@ -175,6 +193,13 @@ if [ "$HF_ONLY" -eq 1 ]; then
 fi
 
 if [ "$SKIP_DRIVER" -eq 0 ]; then
+  # Pre-authenticate sudo up front so quiet runs don't stall on the password
+  # prompt mid-install (the dependencies step needs sudo). Asks once now, or not
+  # at all under NOPASSWD; harmless when sudo is already cached.
+  if [ "$YES" -eq 1 ]; then
+    log "Caching sudo credentials up front (needed for the dependencies step)"
+    sudo -v || die "sudo authentication failed — required for --type dependencies"
+  fi
   section_1_install
 else
   warn "--skip-driver: assuming the SynapseAI driver + venv are already installed"
