@@ -133,8 +133,9 @@ class ManagementClient:
         if resp.status_code == 401:
             raise SystemExit(
                 "enrollment rejected (401): the code is invalid, already used, or was "
-                "rotated. Re-issue the code in the admin UI and update ENROLL_CODE in "
-                "/etc/devozs-gpu-agent.env (then re-run bootstrap.sh --force or edit the file)."
+                "rotated. Re-issue the code in the admin UI and re-run its Install and "
+                "enroll command, or update ENROLL_CODE in "
+                "/etc/devozs-gpu-agent.env before running enroll.sh again."
             )
         resp.raise_for_status()
         data = resp.json()

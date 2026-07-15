@@ -15,7 +15,9 @@
 #   --env-file PATH  config to source (default: /etc/devozs-gpu-agent.env)
 #
 # Idempotent: once a token is cached the enrollment code is ignored, so re-running
-# just re-runs preflight against the cached token.
+# validates the cached token and re-runs preflight. If management rejects a cached
+# token with 401 (for example after code rotation), the agent clears it and redeems
+# ENROLL_CODE. Network failures and server errors never clear the cached token.
 
 set -euo pipefail
 

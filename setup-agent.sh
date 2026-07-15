@@ -32,9 +32,11 @@
 #   OPTIMUM_HABANA    optimum-habana version for §3     (default 1.21.0)
 #   TRANSFORMERS      transformers pin (matches OH)      (default >=4.55,<4.56)
 #
-# This script is idempotent-ish: re-running skips clones/installs that already
-# exist. It is intentionally bare-metal (no Docker) — on Gaudi the SynapseAI
-# userspace must match the host driver exactly, which a container can break.
+# This script is idempotent: when hl-smi and the Habana Python environment are
+# already healthy, re-running skips the driver and PyTorch installers and repeats
+# verification. It is intentionally bare-metal (no Docker) — on Gaudi the
+# SynapseAI userspace must match the host driver exactly, which a container can
+# break.
 
 set -euo pipefail
 
@@ -190,6 +192,14 @@ section_3_hf() {
 if [ "$HF_ONLY" -eq 1 ]; then
   section_3_hf
   exit 0
+fi
+
+if [ "$SKIP_DRIVER" -eq 0 ] \
+  && command -v hl-smi >/dev/null \
+  && [ -x "$VENV/bin/python" ] \
+  && "$VENV/bin/python" -c 'import torch, habana_frameworks.torch.core' >/dev/null 2>&1; then
+  SKIP_DRIVER=1
+  warn "existing SynapseAI driver + Habana venv detected; skipping reinstall"
 fi
 
 if [ "$SKIP_DRIVER" -eq 0 ]; then

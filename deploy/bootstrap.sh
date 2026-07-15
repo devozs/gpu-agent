@@ -33,7 +33,7 @@
 #   --type   CUDA|HPU accelerator family on this box       (required unless --check-only)
 #   --enroll-code C   one-time enrollment code (omit if the box is already
 #                     enrolled and the token is cached)
-#   --env-file PATH   source template to start from
+#   --env-file PATH   source template for the first install or a --force reset
 #                     (default: deploy/devozs-gpu-agent.env.example)
 #   --user NAME       own the env file as this user        (default: current user)
 #   --http-proxy URL  corporate proxy for OUTBOUND internet (HuggingFace) egress.
@@ -45,7 +45,7 @@
 #                     without it real jobs die at from_pretrained() with
 #                     "[Errno 101] Network is unreachable".
 #   --no-proxy        write no proxy lines even if the shell has them set
-#   --force           overwrite an existing /etc/devozs-gpu-agent.env
+#   --force           reset an existing env file from the source template
 #   --skip-check      write the env file but don't run the sanity check
 #   --check-only      only re-run the reachability check (no writing); reads
 #                     MGMT_URL from /etc/devozs-gpu-agent.env unless --mgmt-url given
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 SERVICE_NAME="devozs-gpu-agent"
-ENV_DEST="/etc/${SERVICE_NAME}.env"
+ENV_DEST="${ENV_DEST:-/etc/${SERVICE_NAME}.env}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_SRC="$SCRIPT_DIR/${SERVICE_NAME}.env.example"
@@ -110,7 +110,6 @@ else
   [ -n "$MGMT_URL" ]   || die "--mgmt-url is required (e.g. http://10.111.56.26/api)"
   [ -n "$AGENT_TYPE" ] || die "--type is required (CUDA or HPU)"
   case "$AGENT_TYPE" in CUDA|HPU) ;; *) die "--type must be CUDA or HPU (got '$AGENT_TYPE')" ;; esac
-  [ -f "$ENV_SRC" ]    || die "env template not found: $ENV_SRC"
 fi
 
 if [ "$CHECK_ONLY" -ne 1 ]; then
@@ -124,18 +123,24 @@ if [ "$CHECK_ONLY" -ne 1 ]; then
   echo "  proxy   : $([ -n "$HTTP_PROXY_VAL" ] && echo "$HTTP_PROXY_VAL" || echo '<none — direct internet>')"
   echo "  owner   : $RUN_USER ($RUN_GROUP)"
 
-  # --- write the env file ----------------------------------------------------
+  # Preserve host-specific settings when re-running (proxy, HF token, work dir,
+  # etc.) while replacing the control-plane fields supplied on this invocation.
+  # --force intentionally resets from the source template.
+  CONFIG_SRC="$ENV_SRC"
   if [ -f "$ENV_DEST" ] && [ "$FORCE" -ne 1 ]; then
-    die "$ENV_DEST already exists — re-run with --force to overwrite it, or --check-only to just re-test connectivity"
+    CONFIG_SRC="$ENV_DEST"
+    log "updating existing env file (host-specific settings are preserved)"
+  elif [ -f "$ENV_DEST" ]; then
+    log "resetting existing env file from $ENV_SRC"
   fi
+  [ -f "$CONFIG_SRC" ] || die "env source not found: $CONFIG_SRC"
 
-  # Start from the example, then set MGMT_URL / AGENT_TYPE (and ENROLL_CODE if
-  # given, uncommenting the line). Anything else in the template (proxy block,
-  # GC_KERNEL_PATH, PT_HPU_LAZY_MODE) is preserved for the admin to tweak.
+  # Set MGMT_URL / AGENT_TYPE and, when supplied, replace ENROLL_CODE. Every
+  # other setting from CONFIG_SRC remains unchanged.
   tmp_env="$(mktemp)"
   sed -e "s#^MGMT_URL=.*#MGMT_URL=${MGMT_URL}#" \
       -e "s#^AGENT_TYPE=.*#AGENT_TYPE=${AGENT_TYPE}#" \
-      "$ENV_SRC" > "$tmp_env"
+      "$CONFIG_SRC" > "$tmp_env"
 
   if [ -n "$ENROLL_CODE" ]; then
     if grep -qE '^#?ENROLL_CODE=' "$tmp_env"; then
@@ -153,7 +158,12 @@ if [ "$CHECK_ONLY" -ne 1 ]; then
   # uncomment + fill them when a proxy is in play. NO_PROXY always includes the
   # mgmt host's network so heartbeat/claim traffic bypasses the DMZ proxy (a 10.x
   # host is covered by 10.0.0.0/8). --no-proxy / an empty value leaves them off.
-  if [ "$NO_PROXY_OPT" -eq 1 ] || [ -z "$HTTP_PROXY_VAL" ]; then
+  if [ "$NO_PROXY_OPT" -eq 1 ]; then
+    sed -i -E 's/^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)=/#\1=/' "$tmp_env"
+    ok "proxy disabled by --no-proxy"
+  elif [ -z "$HTTP_PROXY_VAL" ] && grep -qE '^(HTTPS_PROXY|https_proxy)=' "$tmp_env"; then
+    ok "preserving proxy settings from $CONFIG_SRC"
+  elif [ -z "$HTTP_PROXY_VAL" ]; then
     warn "no proxy set — the service will reach the internet directly. If huggingface.co"
     warn "is only reachable via a proxy on this box, re-run with --http-proxy URL or jobs"
     warn "will fail with '[Errno 101] Network is unreachable' at from_pretrained()."

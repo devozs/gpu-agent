@@ -57,3 +57,6 @@ class AgentConfig:
             p.chmod(0o600)
         except OSError:
             pass
+
+    def clear_token(self) -> None:
+        self.token_path().unlink(missing_ok=True)

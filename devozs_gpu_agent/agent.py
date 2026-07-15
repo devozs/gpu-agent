@@ -132,7 +132,26 @@ def _ensure_enrolled(cfg: AgentConfig, client: ManagementClient) -> None:
     token = cfg.load_token()
     if token:
         client.token = token
-        return
+        try:
+            client.heartbeat("IDLE")
+            LOGGER.info("reusing cached enrollment token")
+            return
+        except requests.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status != 401:
+                raise
+            if not cfg.enroll_code:
+                raise SystemExit(
+                    "cached enrollment token was rejected (401). Re-issue the "
+                    "resource enrollment code in the admin UI, update ENROLL_CODE, "
+                    "and run enrollment again."
+                ) from error
+            LOGGER.info(
+                "cached enrollment token was rejected; redeeming the supplied "
+                "replacement code"
+            )
+            client.token = None
+            cfg.clear_token()
     if not cfg.enroll_code:
         raise SystemExit(
             "no bearer token and no ENROLL_CODE set. Create the resource in the "
@@ -141,6 +160,7 @@ def _ensure_enrolled(cfg: AgentConfig, client: ManagementClient) -> None:
     LOGGER.info("enrolling with management at %s", cfg.mgmt_url)
     data = client.enroll(cfg.enroll_code, _detect_capabilities(cfg))
     cfg.save_token(data["token"])
+    client.token = data["token"]
     LOGGER.info("enrolled as resource %s (%s)", data.get("name"), data.get("resourceId"))
 
 
